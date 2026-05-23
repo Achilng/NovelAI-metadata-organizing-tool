@@ -1808,7 +1808,9 @@ name = "novelai-metadata-organizing-tool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

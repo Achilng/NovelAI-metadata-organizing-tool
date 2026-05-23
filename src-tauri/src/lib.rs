@@ -2,6 +2,8 @@ use serde::Serialize;
 use std::path::Path;
 use tauri::{AppHandle, Emitter};
 
+mod extractor;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileWarning {
     path: String,
