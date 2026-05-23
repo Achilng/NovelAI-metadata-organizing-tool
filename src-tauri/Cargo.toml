@@ -1,0 +1,21 @@
+[package]
+name = "novelai-metadata-organizing-tool"
+version = "0.1.0"
+description = "NovelAI PNG metadata organizer"
+authors = ["Achilng"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "novelai_metadata_organizing_tool_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = "2.6.2"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = "2.11.2"
+tauri-plugin-dialog = "2.7.1"
+thiserror = "2.0"
