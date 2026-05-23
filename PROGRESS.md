@@ -32,6 +32,7 @@
   - `src-tauri\target\release\bundle\msi\NovelAI 元数据整理工具_0.1.0_x64_zh-CN.msi`
   - `src-tauri\target\release\bundle\nsis\NovelAI 元数据整理工具_0.1.0_x64-setup.exe`
 - 补充空文件夹、嵌套文件夹、非 NovelAI PNG、损坏 PNG 自动化验证。
+- 修复 release 版启动时额外弹出命令行窗口的问题。
 
 ## 进行中
 - 无。首版核心功能已完成。
@@ -48,3 +49,4 @@
 - 2026-05-23：完成 `.zip`、`.7z`、`.rar` 压缩包输入主链路；验证 `cargo test` 12 个测试通过，`cargo check` 和 `npm run build` 通过。
 - 2026-05-23：完成 Windows 打包验证；`npm run tauri:build` 成功生成 MSI 和 NSIS 安装包。
 - 2026-05-23：补齐端到端异常场景自动化验证；`cargo test` 16 个测试全部通过。
+- 2026-05-23：为 Windows release 入口添加 GUI 子系统声明，避免启动 `.exe` 时显示控制台窗口。
