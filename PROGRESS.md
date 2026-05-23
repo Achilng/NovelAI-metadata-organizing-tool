@@ -31,11 +31,12 @@
 - 完成 Tauri Windows release 构建，产物：
   - `src-tauri\target\release\bundle\msi\NovelAI 元数据整理工具_0.1.0_x64_zh-CN.msi`
   - `src-tauri\target\release\bundle\nsis\NovelAI 元数据整理工具_0.1.0_x64-setup.exe`
+- 补充空文件夹、嵌套文件夹、非 NovelAI PNG、损坏 PNG 自动化验证。
 
 ## 进行中
-- 首版完成，等待真实 NovelAI 图片样例进一步验收。
+- 无。首版核心功能已完成。
 
-## 待办
+## 后续建议
 - 使用用户实际 NovelAI PNG / `.zip` / `.7z` / `.rar` 样例做人工验收。
 - 视需要补充取消按钮、拖放输入和导出源路径等增强功能。
 
@@ -46,3 +47,4 @@
 - 2026-05-23：完成文件夹输入到 XLSX 输出主链路；验证 `cargo test` 9 个测试通过，`cargo check` 和 `npm run build` 通过。
 - 2026-05-23：完成 `.zip`、`.7z`、`.rar` 压缩包输入主链路；验证 `cargo test` 12 个测试通过，`cargo check` 和 `npm run build` 通过。
 - 2026-05-23：完成 Windows 打包验证；`npm run tauri:build` 成功生成 MSI 和 NSIS 安装包。
+- 2026-05-23：补齐端到端异常场景自动化验证；`cargo test` 16 个测试全部通过。

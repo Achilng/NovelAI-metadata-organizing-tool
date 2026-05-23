@@ -424,6 +424,86 @@ mod tests {
     }
 
     #[test]
+    fn scans_nested_png_folder() {
+        let root = test_root("scans_nested_png_folder");
+        let input = root.join("input").join("nested");
+        fs::create_dir_all(&input).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:nested");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&root.join("input"), &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.failed, 0);
+        assert_xlsx_contains(&output, &["artist:nested"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handles_empty_folder() {
+        let root = test_root("handles_empty_folder");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&input, &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 0);
+        assert_eq!(summary.processed, 0);
+        assert_eq!(summary.failed, 0);
+        assert!(summary.warnings.is_empty());
+        assert!(output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_non_novelai_png_without_crashing() {
+        let root = test_root("reports_non_novelai_png_without_crashing");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        create_test_png(&input.join("plain.png"));
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&input, &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.warnings.len(), 1);
+        assert!(output.exists());
+        assert_xlsx_has_media(&output);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reports_broken_png_without_crashing() {
+        let root = test_root("reports_broken_png_without_crashing");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        fs::write(input.join("broken.png"), b"not a png").unwrap();
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&input, &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.failed, 1);
+        assert!(!summary.warnings.is_empty());
+        assert!(output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn exports_zip_archive_to_xlsx() {
         let root = test_root("exports_zip_archive_to_xlsx");
         let input = root.join("input");
@@ -533,6 +613,16 @@ mod tests {
         for text in expected_text {
             assert!(shared_strings.contains(text));
         }
+    }
+
+    fn assert_xlsx_has_media(output: &Path) {
+        let file = File::open(output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name.starts_with("xl/media/")));
     }
 
     fn insert_text_chunk(path: &Path, keyword: &str, text: &str) {
