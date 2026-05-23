@@ -392,7 +392,7 @@ mod tests {
     use image::{Rgb, RgbImage};
     use std::fs;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
@@ -418,6 +418,7 @@ mod tests {
         assert!(summary.warnings.is_empty());
         assert!(output.exists());
         assert!(fs::metadata(&output).unwrap().len() > 0);
+        assert_xlsx_contains(&output, &["best quality, artist:demo", "bad hands"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -511,6 +512,27 @@ mod tests {
         zip.start_file("nested/sample.png", options).unwrap();
         zip.write_all(&fs::read(png_path).unwrap()).unwrap();
         zip.finish().unwrap();
+    }
+
+    fn assert_xlsx_contains(output: &Path, expected_text: &[&str]) {
+        let file = File::open(output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name.starts_with("xl/media/")));
+
+        let mut shared_strings = String::new();
+        archive
+            .by_name("xl/sharedStrings.xml")
+            .unwrap()
+            .read_to_string(&mut shared_strings)
+            .unwrap();
+
+        for text in expected_text {
+            assert!(shared_strings.contains(text));
+        }
     }
 
     fn insert_text_chunk(path: &Path, keyword: &str, text: &str) {

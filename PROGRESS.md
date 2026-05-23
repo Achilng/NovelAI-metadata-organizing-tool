@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## 当前状态
-- 文件夹和 `.zip`/`.7z`/`.rar` 压缩包输入到 Excel 输出的主链路已跑通，进入端到端运行和打包验证。
+- 首版工具已完成核心功能和 Windows 打包验证。
 - 已确认目标：开发一个 NovelAI 图像元数据整理工具，支持 GUI 输入、PNG 元数据提取和 Excel 导出。
 
 ## 已完成
@@ -26,14 +26,18 @@
 - 使用 `unrar-ng` 实现 `.rar` 解压输入，不依赖外部 7z 命令。
 - 添加 ZIP、7z 和 RAR 到 XLSX 的后端样例测试。
 - 修复并发运行时临时目录 ID 冲突风险。
+- 强化 XLSX 样例测试，验证工作簿中包含嵌入图片和提示词文本。
+- 配置 Windows MSI 语言为 `zh-CN`，解决中文产品名在 WiX 默认代码页下无法打包的问题。
+- 完成 Tauri Windows release 构建，产物：
+  - `src-tauri\target\release\bundle\msi\NovelAI 元数据整理工具_0.1.0_x64_zh-CN.msi`
+  - `src-tauri\target\release\bundle\nsis\NovelAI 元数据整理工具_0.1.0_x64-setup.exe`
 
 ## 进行中
-- 端到端运行验证和 Windows 打包验证。
+- 首版完成，等待真实 NovelAI 图片样例进一步验收。
 
 ## 待办
-- 添加端到端样例验证。
-- 构建 Windows 桌面安装包。
-- 记录打包产物和任何运行时注意事项。
+- 使用用户实际 NovelAI PNG / `.zip` / `.7z` / `.rar` 样例做人工验收。
+- 视需要补充取消按钮、拖放输入和导出源路径等增强功能。
 
 ## 记录
 - 2026-05-23：创建 `PROGRESS.md`。
@@ -41,3 +45,4 @@
 - 2026-05-23：完成后端 PNG 文本元数据与 NovelAI 提示词解析核心；验证 `cargo test` 通过，8 个测试全部成功。
 - 2026-05-23：完成文件夹输入到 XLSX 输出主链路；验证 `cargo test` 9 个测试通过，`cargo check` 和 `npm run build` 通过。
 - 2026-05-23：完成 `.zip`、`.7z`、`.rar` 压缩包输入主链路；验证 `cargo test` 12 个测试通过，`cargo check` 和 `npm run build` 通过。
+- 2026-05-23：完成 Windows 打包验证；`npm run tauri:build` 成功生成 MSI 和 NSIS 安装包。
