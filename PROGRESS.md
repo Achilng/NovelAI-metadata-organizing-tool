@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## 当前状态
-- 应用骨架阶段完成，后端核心元数据解析已完成，进入输入扫描和 Excel 导出开发。
+- 文件夹输入到 Excel 输出的主链路已跑通，进入压缩包输入支持开发。
 - 已确认目标：开发一个 NovelAI 图像元数据整理工具，支持 GUI 输入、PNG 元数据提取和 Excel 导出。
 
 ## 已完成
@@ -16,17 +16,23 @@
 - 实现 NovelAI `Description`、`Comment.prompt`、`Comment.uc` 和 v4 caption 结构解析。
 - 实现画师标签提取和去重规则。
 - 添加 8 个后端单元测试覆盖 PNG 文本读取、提示词解析和画师标签提取。
+- 实现文件夹递归扫描和单个 PNG 输入识别。
+- 实现 160px PNG 缩略图生成，临时文件位于 `D:\Agent\Agent_temp\novelai_metadata_extractor`。
+- 使用 `rust_xlsxwriter` 生成带图片缩略图、正向提示词、负向提示词和画师串的 `.xlsx`。
+- 将真实文件夹处理流程接入 `extract_to_xlsx` Tauri 命令和前端进度事件。
+- 添加文件夹到 XLSX 的后端样例测试。
 
 ## 进行中
-- 文件夹/压缩包输入扫描和 XLSX 导出开发。
+- 压缩包输入支持开发。
 
 ## 待办
-- 实现文件夹递归扫描和压缩包输入处理。
-- 实现缩略图创建和 XLSX 写入。
-- 将真实提取流程接入 `extract_to_xlsx` 命令。
+- 实现 `.zip` 输入解压。
+- 实现 `.7z` 输入解压。
+- 调研并接入 `.rar` 输入处理。
 - 添加端到端样例验证。
 
 ## 记录
 - 2026-05-23：创建 `PROGRESS.md`。
 - 2026-05-23：完成可构建应用骨架；验证 `npm run build` 和 `cargo check` 通过。
 - 2026-05-23：完成后端 PNG 文本元数据与 NovelAI 提示词解析核心；验证 `cargo test` 通过，8 个测试全部成功。
+- 2026-05-23：完成文件夹输入到 XLSX 输出主链路；验证 `cargo test` 9 个测试通过，`cargo check` 和 `npm run build` 通过。

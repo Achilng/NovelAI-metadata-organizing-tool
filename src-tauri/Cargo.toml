@@ -16,8 +16,14 @@ tauri-build = "2.6.2"
 [dependencies]
 anyhow = "1.0"
 flate2 = "1.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rust_xlsxwriter = "0.95.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = "2.11.2"
 tauri-plugin-dialog = "2.7.1"
 thiserror = "2.0"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+crc32fast = "1.5"
