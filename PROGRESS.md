@@ -1,7 +1,7 @@
 # PROGRESS
 
 ## 当前状态
-- 首版工具已完成核心功能和 Windows 打包验证。
+- 首版工具已完成核心功能、Windows 打包验证和导出去重开关。
 - 已确认目标：开发一个 NovelAI 图像元数据整理工具，支持 GUI 输入、PNG 元数据提取和 Excel 导出。
 
 ## 已完成
@@ -33,6 +33,11 @@
   - `src-tauri\target\release\bundle\nsis\NovelAI 元数据整理工具_0.1.0_x64-setup.exe`
 - 补充空文件夹、嵌套文件夹、非 NovelAI PNG、损坏 PNG 自动化验证。
 - 修复 release 版启动时额外弹出命令行窗口的问题。
+- 新增导出去重开关：
+  - 正面提示词去重。
+  - 画师串去重。
+  - UI 显示去重跳过数量，后端 `RunSummary` 返回 `skipped_duplicates`。
+- 补充正面提示词去重和画师串去重的自动化测试，验证 XLSX 实际嵌入图片数量。
 
 ## 进行中
 - 无。首版核心功能已完成。
@@ -50,3 +55,4 @@
 - 2026-05-23：完成 Windows 打包验证；`npm run tauri:build` 成功生成 MSI 和 NSIS 安装包。
 - 2026-05-23：补齐端到端异常场景自动化验证；`cargo test` 16 个测试全部通过。
 - 2026-05-23：为 Windows release 入口添加 GUI 子系统声明，避免启动 `.exe` 时显示控制台窗口。
+- 2026-05-24：新增正面提示词/画师串导出去重开关；验证 `cargo test` 18 个测试全部通过，`npm.cmd run build` 和 `npm.cmd run tauri:build` 通过。

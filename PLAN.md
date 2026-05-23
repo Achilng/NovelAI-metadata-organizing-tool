@@ -29,6 +29,10 @@
 - 画师标签提取规则：
   - 将正向提示词拆分为提示词片段。
   - 保留包含 `artist` 的片段，例如 `artist:maidcode1023`、`0.5::artist:xxx::` 和 `-3::artist collaboration::`。
+- 支持可选导出去重：
+  - 按完整正向提示词去重。
+  - 按提取后的画师串去重。
+  - 两个开关可独立启用。
 - 应用应通过图形界面对非技术用户可用。
 
 ## 3. 约束
@@ -83,6 +87,7 @@
 前端
   - 输入路径选择器
   - 输出 xlsx 选择器
+  - 导出去重开关
   - 开始按钮
   - 进度/日志区域
   - 完成/错误状态
@@ -99,6 +104,7 @@ Rust 提取服务
   - 提取正向提示词
   - 提取负向提示词
   - 提取画师标签
+  - 应用可选去重规则
   - 创建缩略图
   - 生成 XLSX
   - 清理临时文件
@@ -117,6 +123,9 @@ Rust 提取服务
 - 输出选择器：
   - 按钮：选择 `.xlsx` 保存路径
   - 只读路径显示
+- 去重选项：
+  - 正面提示词去重开关
+  - 画师串去重开关
 - 开始按钮：
   - 在输入和输出都有效之前禁用
 - 处理状态：
@@ -126,6 +135,7 @@ Rust 提取服务
     - PNG 文件总数
     - 已处理文件数
     - 失败文件数
+    - 去重跳过数
 - 结果状态：
   - 成功消息，包含输出路径
   - 无法解析文件的错误列表
@@ -195,6 +205,14 @@ artist:sune (mugendai)
 -3::artist collaboration::
 ```
 
+## 8.1 导出去重选项
+
+导出前可按以下键跳过重复图片：
+- 正面提示词去重：使用裁剪首尾空白后的完整正向提示词作为 key，空值不参与去重。
+- 画师串去重：使用提取出的画师片段按换行连接后的字符串作为 key，空值不参与去重。
+- 保留扫描顺序中第一张成功写入 XLSX 的图片；后续重复图片不生成缩略图、不写入工作簿，并计入 `skipped_duplicates`。
+- 两个开关同时启用时，只要任一 key 已存在，就跳过该图片。
+
 ## 9. 压缩包处理
 
 ### 文件夹输入
@@ -258,7 +276,12 @@ artist:sune (mugendai)
 
 ```rust
 #[tauri::command]
-async fn extract_to_xlsx(input_path: String, output_path: String) -> Result<RunSummary, String>
+async fn extract_to_xlsx(
+    input_path: String,
+    output_path: String,
+    dedupe_positive_prompt: bool,
+    dedupe_artist_tags: bool,
+) -> Result<RunSummary, String>
 ```
 
 进度事件：
@@ -279,6 +302,7 @@ struct RunSummary {
     total_png: usize,
     processed: usize,
     failed: usize,
+    skipped_duplicates: usize,
     output_path: String,
     warnings: Vec<FileWarning>,
 }

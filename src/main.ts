@@ -7,6 +7,7 @@ type RunSummary = {
   total_png: number;
   processed: number;
   failed: number;
+  skipped_duplicates: number;
   output_path: string;
   warnings: FileWarning[];
 };
@@ -20,6 +21,7 @@ type ProgressPayload = {
   total_png?: number;
   processed?: number;
   failed?: number;
+  skipped_duplicates?: number;
   current_file?: string;
   message?: string;
 };
@@ -28,8 +30,11 @@ const state = {
   inputPath: "",
   outputPath: "",
   isRunning: false,
+  dedupePositivePrompt: false,
+  dedupeArtistTags: false,
   processed: 0,
   failed: 0,
+  skippedDuplicates: 0,
   total: 0,
   currentFile: "",
   status: "请选择输入和输出路径。",
@@ -63,6 +68,20 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       </div>
     </section>
 
+    <section class="panel">
+      <div class="section-title">去重选项</div>
+      <div class="options-grid">
+        <label class="toggle-option">
+          <input id="dedupe-positive-prompt" type="checkbox" />
+          <span>正面提示词去重</span>
+        </label>
+        <label class="toggle-option">
+          <input id="dedupe-artist-tags" type="checkbox" />
+          <span>画师串去重</span>
+        </label>
+      </div>
+    </section>
+
     <section class="panel status-panel">
       <div class="status-head">
         <div>
@@ -77,6 +96,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <span>总数 <strong id="total">0</strong></span>
         <span>已处理 <strong id="processed">0</strong></span>
         <span>失败 <strong id="failed">0</strong></span>
+        <span>去重跳过 <strong id="skipped-duplicates">0</strong></span>
       </div>
       <div class="current-file">
         <span>当前文件</span>
@@ -97,6 +117,10 @@ const chooseFolderButton = document.querySelector<HTMLButtonElement>("#choose-fo
 const chooseArchiveButton = document.querySelector<HTMLButtonElement>("#choose-archive")!;
 const chooseOutputButton = document.querySelector<HTMLButtonElement>("#choose-output")!;
 const startButton = document.querySelector<HTMLButtonElement>("#start")!;
+const dedupePositivePromptCheckbox = document.querySelector<HTMLInputElement>(
+  "#dedupe-positive-prompt"
+)!;
+const dedupeArtistTagsCheckbox = document.querySelector<HTMLInputElement>("#dedupe-artist-tags")!;
 const inputPathOutput = document.querySelector<HTMLOutputElement>("#input-path")!;
 const outputPathOutput = document.querySelector<HTMLOutputElement>("#output-path")!;
 const statusMessage = document.querySelector<HTMLParagraphElement>("#status-message")!;
@@ -104,6 +128,7 @@ const progress = document.querySelector<HTMLProgressElement>("#progress")!;
 const total = document.querySelector<HTMLElement>("#total")!;
 const processed = document.querySelector<HTMLElement>("#processed")!;
 const failed = document.querySelector<HTMLElement>("#failed")!;
+const skippedDuplicates = document.querySelector<HTMLElement>("#skipped-duplicates")!;
 const currentFile = document.querySelector<HTMLOutputElement>("#current-file")!;
 const warnings = document.querySelector<HTMLUListElement>("#warnings")!;
 
@@ -114,6 +139,7 @@ function render() {
   total.textContent = String(state.total);
   processed.textContent = String(state.processed);
   failed.textContent = String(state.failed);
+  skippedDuplicates.textContent = String(state.skippedDuplicates);
   currentFile.textContent = state.currentFile || "-";
 
   const percent = state.total === 0 ? 0 : Math.round((state.processed / state.total) * 100);
@@ -124,6 +150,10 @@ function render() {
   chooseFolderButton.disabled = state.isRunning;
   chooseArchiveButton.disabled = state.isRunning;
   chooseOutputButton.disabled = state.isRunning;
+  dedupePositivePromptCheckbox.checked = state.dedupePositivePrompt;
+  dedupePositivePromptCheckbox.disabled = state.isRunning;
+  dedupeArtistTagsCheckbox.checked = state.dedupeArtistTags;
+  dedupeArtistTagsCheckbox.disabled = state.isRunning;
 
   warnings.innerHTML = "";
   if (state.warnings.length === 0) {
@@ -180,6 +210,16 @@ chooseOutputButton.addEventListener("click", async () => {
   render();
 });
 
+dedupePositivePromptCheckbox.addEventListener("change", () => {
+  state.dedupePositivePrompt = dedupePositivePromptCheckbox.checked;
+  render();
+});
+
+dedupeArtistTagsCheckbox.addEventListener("change", () => {
+  state.dedupeArtistTags = dedupeArtistTagsCheckbox.checked;
+  render();
+});
+
 startButton.addEventListener("click", async () => {
   if (!state.inputPath || !state.outputPath || state.isRunning) {
     return;
@@ -189,6 +229,7 @@ startButton.addEventListener("click", async () => {
   state.total = 0;
   state.processed = 0;
   state.failed = 0;
+  state.skippedDuplicates = 0;
   state.currentFile = "";
   state.warnings = [];
   state.status = "正在处理...";
@@ -197,13 +238,19 @@ startButton.addEventListener("click", async () => {
   try {
     const summary = await invoke<RunSummary>("extract_to_xlsx", {
       inputPath: state.inputPath,
-      outputPath: state.outputPath
+      outputPath: state.outputPath,
+      dedupePositivePrompt: state.dedupePositivePrompt,
+      dedupeArtistTags: state.dedupeArtistTags
     });
     state.total = summary.total_png;
     state.processed = summary.processed;
     state.failed = summary.failed;
+    state.skippedDuplicates = summary.skipped_duplicates;
     state.warnings = summary.warnings;
-    state.status = `完成：已生成 ${summary.output_path}`;
+    state.status =
+      summary.skipped_duplicates > 0
+        ? `完成：已生成 ${summary.output_path}，去重跳过 ${summary.skipped_duplicates} 张`
+        : `完成：已生成 ${summary.output_path}`;
   } catch (error) {
     state.status = error instanceof Error ? error.message : String(error);
   } finally {
@@ -217,12 +264,14 @@ await listen<ProgressPayload>("extract:start", (event) => {
   state.total = event.payload.total_png ?? 0;
   state.processed = 0;
   state.failed = 0;
+  state.skippedDuplicates = 0;
   state.status = event.payload.message ?? "开始处理...";
   render();
 });
 
 await listen<ProgressPayload>("extract:scan_complete", (event) => {
   state.total = event.payload.total_png ?? state.total;
+  state.skippedDuplicates = event.payload.skipped_duplicates ?? state.skippedDuplicates;
   state.status = event.payload.message ?? "扫描完成。";
   render();
 });
@@ -230,6 +279,7 @@ await listen<ProgressPayload>("extract:scan_complete", (event) => {
 await listen<ProgressPayload>("extract:file_progress", (event) => {
   state.processed = event.payload.processed ?? state.processed;
   state.failed = event.payload.failed ?? state.failed;
+  state.skippedDuplicates = event.payload.skipped_duplicates ?? state.skippedDuplicates;
   state.currentFile = event.payload.current_file ?? "";
   state.status = event.payload.message ?? "正在处理...";
   render();
@@ -241,4 +291,3 @@ await listen<FileWarning>("extract:file_warning", (event) => {
 });
 
 render();
-

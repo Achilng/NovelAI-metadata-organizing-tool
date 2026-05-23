@@ -110,6 +110,35 @@ p {
   white-space: nowrap;
 }
 
+.options-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.toggle-option {
+  align-items: center;
+  background: #f6f8fb;
+  border: 1px solid #d9dee7;
+  border-radius: 6px;
+  color: #273344;
+  display: flex;
+  gap: 8px;
+  min-height: 36px;
+  padding: 8px 10px;
+}
+
+.toggle-option input {
+  accent-color: #285eac;
+  inline-size: 16px;
+  block-size: 16px;
+}
+
+.toggle-option:has(input:disabled) {
+  color: #8b96a6;
+  opacity: 0.72;
+}
+
 .status-panel {
   display: grid;
   gap: 14px;
@@ -237,4 +266,3 @@ progress::-webkit-progress-value {
     width: 100%;
   }
 }
-

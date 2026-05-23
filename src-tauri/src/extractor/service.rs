@@ -3,6 +3,7 @@ use super::png_text::read_png_text_chunks;
 use super::xlsx::{write_xlsx, WorkbookRow};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -37,6 +38,7 @@ pub struct RunSummary {
     pub total_png: usize,
     pub processed: usize,
     pub failed: usize,
+    pub skipped_duplicates: usize,
     pub output_path: String,
     pub warnings: Vec<FileWarning>,
 }
@@ -46,6 +48,7 @@ pub struct ProgressPayload {
     pub total_png: Option<usize>,
     pub processed: Option<usize>,
     pub failed: Option<usize>,
+    pub skipped_duplicates: Option<usize>,
     pub current_file: Option<String>,
     pub message: Option<String>,
 }
@@ -65,6 +68,12 @@ impl ProgressSink for NoopProgressSink {}
 struct SourceImage {
     absolute_path: PathBuf,
     display_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractionOptions {
+    pub dedupe_positive_prompt: bool,
+    pub dedupe_artist_tags: bool,
 }
 
 struct RunTempDir {
@@ -96,9 +105,24 @@ impl Drop for RunTempDir {
     }
 }
 
-pub fn run_extraction(
+#[cfg(test)]
+fn run_extraction(
     input_path: &Path,
     output_path: &Path,
+    progress: &dyn ProgressSink,
+) -> Result<RunSummary> {
+    run_extraction_with_options(
+        input_path,
+        output_path,
+        ExtractionOptions::default(),
+        progress,
+    )
+}
+
+pub fn run_extraction_with_options(
+    input_path: &Path,
+    output_path: &Path,
+    options: ExtractionOptions,
     progress: &dyn ProgressSink,
 ) -> Result<RunSummary> {
     validate_paths(input_path, output_path)?;
@@ -109,6 +133,7 @@ pub fn run_extraction(
             total_png: Some(0),
             processed: Some(0),
             failed: Some(0),
+            skipped_duplicates: Some(0),
             current_file: None,
             message: Some("正在扫描输入路径...".to_string()),
         },
@@ -125,6 +150,7 @@ pub fn run_extraction(
             total_png: Some(total_png),
             processed: Some(0),
             failed: Some(0),
+            skipped_duplicates: Some(0),
             current_file: None,
             message: Some(format!("扫描完成，共找到 {} 个 PNG 文件。", total_png)),
         },
@@ -133,6 +159,9 @@ pub fn run_extraction(
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
     let mut failed = 0_usize;
+    let mut skipped_duplicates = 0_usize;
+    let mut seen_positive_prompts = HashSet::new();
+    let mut seen_artist_strings = HashSet::new();
 
     for (index, source) in images.iter().enumerate() {
         let mut file_failed = false;
@@ -159,14 +188,56 @@ pub fn run_extraction(
             warnings.push(warning);
         }
 
+        if let Some(reason) = duplicate_reason(
+            &metadata.positive_prompt,
+            &metadata.artist_tags,
+            options,
+            &seen_positive_prompts,
+            &seen_artist_strings,
+        ) {
+            skipped_duplicates += 1;
+
+            if file_failed {
+                failed += 1;
+            }
+
+            progress.emit_progress(
+                "extract:file_progress",
+                ProgressPayload {
+                    total_png: Some(total_png),
+                    processed: Some(index + 1),
+                    failed: Some(failed),
+                    skipped_duplicates: Some(skipped_duplicates),
+                    current_file: Some(source.display_path.clone()),
+                    message: Some(format!(
+                        "正在处理 {} / {}，已去重跳过 {} 张（{}）",
+                        index + 1,
+                        total_png,
+                        skipped_duplicates,
+                        reason
+                    )),
+                },
+            );
+            continue;
+        }
+
         match create_thumbnail(&source.absolute_path, &temp_dir.path, index) {
-            Ok(thumbnail_path) => rows.push(WorkbookRow {
-                thumbnail_path,
-                source_path: source.display_path.clone(),
-                positive_prompt: metadata.positive_prompt,
-                negative_prompt: metadata.negative_prompt,
-                artist_tags: metadata.artist_tags,
-            }),
+            Ok(thumbnail_path) => {
+                remember_dedup_keys(
+                    &metadata.positive_prompt,
+                    &metadata.artist_tags,
+                    options,
+                    &mut seen_positive_prompts,
+                    &mut seen_artist_strings,
+                );
+                rows.push(WorkbookRow {
+                    thumbnail_path,
+                    source_path: source.display_path.clone(),
+                    positive_prompt: metadata.positive_prompt,
+                    negative_prompt: metadata.negative_prompt,
+                    artist_tags: metadata.artist_tags,
+                });
+            }
             Err(error) => {
                 file_failed = true;
                 let warning = FileWarning::new(
@@ -188,6 +259,7 @@ pub fn run_extraction(
                 total_png: Some(total_png),
                 processed: Some(index + 1),
                 failed: Some(failed),
+                skipped_duplicates: Some(skipped_duplicates),
                 current_file: Some(source.display_path.clone()),
                 message: Some(format!("正在处理 {} / {}", index + 1, total_png)),
             },
@@ -202,6 +274,7 @@ pub fn run_extraction(
             total_png: Some(total_png),
             processed: Some(total_png),
             failed: Some(failed),
+            skipped_duplicates: Some(skipped_duplicates),
             current_file: None,
             message: Some("处理完成。".to_string()),
         },
@@ -211,9 +284,77 @@ pub fn run_extraction(
         total_png,
         processed: total_png,
         failed,
+        skipped_duplicates,
         output_path: output_path.display().to_string(),
         warnings,
     })
+}
+
+fn duplicate_reason(
+    positive_prompt: &str,
+    artist_tags: &[String],
+    options: ExtractionOptions,
+    seen_positive_prompts: &HashSet<String>,
+    seen_artist_strings: &HashSet<String>,
+) -> Option<&'static str> {
+    if options.dedupe_positive_prompt {
+        if let Some(key) = positive_prompt_key(positive_prompt) {
+            if seen_positive_prompts.contains(&key) {
+                return Some("正面提示词重复");
+            }
+        }
+    }
+
+    if options.dedupe_artist_tags {
+        if let Some(key) = artist_tags_key(artist_tags) {
+            if seen_artist_strings.contains(&key) {
+                return Some("画师串重复");
+            }
+        }
+    }
+
+    None
+}
+
+fn remember_dedup_keys(
+    positive_prompt: &str,
+    artist_tags: &[String],
+    options: ExtractionOptions,
+    seen_positive_prompts: &mut HashSet<String>,
+    seen_artist_strings: &mut HashSet<String>,
+) {
+    if options.dedupe_positive_prompt {
+        if let Some(key) = positive_prompt_key(positive_prompt) {
+            seen_positive_prompts.insert(key);
+        }
+    }
+
+    if options.dedupe_artist_tags {
+        if let Some(key) = artist_tags_key(artist_tags) {
+            seen_artist_strings.insert(key);
+        }
+    }
+}
+
+fn positive_prompt_key(value: &str) -> Option<String> {
+    non_empty_key(value)
+}
+
+fn artist_tags_key(values: &[String]) -> Option<String> {
+    let key = values
+        .iter()
+        .filter_map(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    non_empty_key(&key)
+}
+
+fn non_empty_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn validate_paths(input_path: &Path, output_path: &Path) -> Result<()> {
@@ -387,7 +528,7 @@ fn create_thumbnail(source_path: &Path, temp_dir: &Path, index: usize) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{run_extraction, NoopProgressSink};
+    use super::{run_extraction, run_extraction_with_options, ExtractionOptions, NoopProgressSink};
     use crc32fast::Hasher;
     use image::{Rgb, RgbImage};
     use std::fs;
@@ -440,6 +581,78 @@ mod tests {
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 0);
         assert_xlsx_contains(&output, &["artist:nested"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deduplicates_by_positive_prompt_when_enabled() {
+        let root = test_root("deduplicates_by_positive_prompt_when_enabled");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "same prompt, artist:first");
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "same prompt, artist:first");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction_with_options(
+            &input,
+            &output,
+            ExtractionOptions {
+                dedupe_positive_prompt: true,
+                dedupe_artist_tags: false,
+            },
+            &NoopProgressSink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_png, 2);
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+        assert_xlsx_media_count(&output, 1);
+        assert_xlsx_contains(&output, &["same prompt, artist:first"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deduplicates_by_artist_string_when_enabled() {
+        let root = test_root("deduplicates_by_artist_string_when_enabled");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "first prompt, artist:same");
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "second prompt, artist:same");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction_with_options(
+            &input,
+            &output,
+            ExtractionOptions {
+                dedupe_positive_prompt: false,
+                dedupe_artist_tags: true,
+            },
+            &NoopProgressSink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_png, 2);
+        assert_eq!(summary.processed, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+        assert_xlsx_media_count(&output, 1);
+        assert_xlsx_contains(&output, &["first prompt, artist:same"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -623,6 +836,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name.starts_with("xl/media/")));
+    }
+
+    fn assert_xlsx_media_count(output: &Path, expected_count: usize) {
+        let file = File::open(output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let media_count = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .filter(|name| name.starts_with("xl/media/"))
+            .count();
+
+        assert_eq!(media_count, expected_count);
     }
 
     fn insert_text_chunk(path: &Path, keyword: &str, text: &str) {
