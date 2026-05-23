@@ -58,25 +58,24 @@
 需要评估和使用的 Rust crate：
 
 - PNG 元数据：
-  - `png`，用于读取 PNG chunk
-  - 或者一个小型自定义 PNG chunk 读取器，用于 `tEXt`、`zTXt` 和 `iTXt`
+  - 当前实现：小型自定义 PNG chunk 读取器，用于 `tEXt`、`zTXt` 和 `iTXt`
+  - `flate2`，用于解压 `zTXt` 和压缩 `iTXt`
 - JSON：
   - `serde`
   - `serde_json`
 - 压缩包：
   - `zip`，用于 `.zip`
-  - `sevenz-rust` 或同类方案，用于 `.7z`
-  - `unrar`/`unrar_sys`，或基于外部 7z 兼容方案处理 `.rar`
+  - `sevenz-rust`，用于 `.7z`
+  - `unrar-ng`，用于 `.rar`，静态链接 UnRAR 源码，不依赖用户安装外部 7z
 - Excel：
-  - 如果图片插入功能足够，优先使用 `rust_xlsxwriter`
-  - 否则评估 `umya-spreadsheet` 的图片嵌入支持
+  - 当前实现：`rust_xlsxwriter`
 - 图片缩略图：
   - `image`，用于将 PNG 图片缩放为临时缩略图文件
 - 错误处理：
   - `anyhow`
   - `thiserror`
 - 路径和临时文件管理：
-  - `tempfile`，配置为使用 `D:\Agent\Agent_temp` 或其下的子目录
+  - 当前实现：自定义运行临时目录，固定使用 `D:\Agent\Agent_temp\novelai_metadata_extractor\<run_id>`
 
 ## 5. 架构
 
@@ -216,13 +215,14 @@ artist:sune (mugendai)
 
 实现偏好：
 
-1. 如果纯 Rust crate 在 Windows 和目标压缩格式上足够可靠，则使用纯 Rust crate。
-2. 如果 `.rar` 的纯 Rust 支持不可靠，则评估捆绑 7z 二进制文件作为受控依赖，并在实现前记录取舍。
+1. `.zip` 使用 `zip` crate 解压。
+2. `.7z` 使用 `sevenz-rust` 解压。
+3. `.rar` 使用 `unrar-ng` 解压。该方案会静态编译 UnRAR 源码，避免要求用户安装 7z 或 unrar 命令行工具。
 
 开放风险：
 
-- 真正纯 Rust 的 `.rar` 解压能力可能弱于 `.zip`/`.7z`。
-- 这应在 UI 打磨前，用示例 `.rar` 文件尽早验证。
+- `.rar` 已用 CC0 RAR5 fixture 验证基础解压链路，但仍需要用用户实际 NovelAI `.rar` 样例做兼容性验证。
+- 加密压缩包当前不在首版范围内，遇到时应返回用户可读错误。
 
 ## 10. XLSX 生成
 

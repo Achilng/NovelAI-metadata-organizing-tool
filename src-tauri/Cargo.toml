@@ -20,10 +20,13 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 rust_xlsxwriter = "0.95.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sevenz-rust = "0.6.1"
 tauri = "2.11.2"
 tauri-plugin-dialog = "2.7.1"
 thiserror = "2.0"
+unrar-ng = "0.7.7"
 walkdir = "2.5.0"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 crc32fast = "1.5"

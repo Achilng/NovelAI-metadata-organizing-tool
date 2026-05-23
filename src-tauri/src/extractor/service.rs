@@ -4,12 +4,18 @@ use super::xlsx::{write_xlsx, WorkbookRow};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::fs;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use unrar_ng::Archive;
 use walkdir::WalkDir;
+use zip::ZipArchive;
 
 const THUMBNAIL_SIZE: u32 = 160;
 const TEMP_ROOT: &str = r"D:\Agent\Agent_temp";
+static RUN_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileWarning {
@@ -75,7 +81,8 @@ impl RunTempDir {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let path = root.join(format!("run_{}_{}", millis, std::process::id()));
+        let counter = RUN_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!("run_{}_{}_{}", millis, std::process::id(), counter));
         fs::create_dir_all(&path)
             .with_context(|| format!("无法创建运行临时目录：{}", path.display()))?;
 
@@ -108,7 +115,8 @@ pub fn run_extraction(
     );
 
     let temp_dir = RunTempDir::create()?;
-    let images = collect_png_files(input_path)?;
+    let prepared_input_path = prepare_input(input_path, &temp_dir.path)?;
+    let images = collect_png_files(&prepared_input_path)?;
     let total_png = images.len();
 
     progress.emit_progress(
@@ -242,7 +250,11 @@ fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
             }]);
         }
 
-        bail!("当前阶段仅支持文件夹或单个 PNG 输入，压缩包支持将在下一步接入。");
+        if is_supported_archive(input_path) {
+            bail!("压缩包输入未能解压。");
+        }
+
+        bail!("输入文件必须是 PNG、.zip、.7z 或 .rar。");
     }
 
     if !input_path.is_dir() {
@@ -279,6 +291,84 @@ fn is_png(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
 }
 
+fn is_supported_archive(path: &Path) -> bool {
+    archive_extension(path).is_some()
+}
+
+fn archive_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_lowercase();
+    match extension.as_str() {
+        "zip" | "7z" | "rar" => Some(extension),
+        _ => None,
+    }
+}
+
+fn prepare_input(input_path: &Path, temp_dir: &Path) -> Result<PathBuf> {
+    let Some(extension) = archive_extension(input_path) else {
+        return Ok(input_path.to_path_buf());
+    };
+
+    let extract_dir = temp_dir.join("archive");
+    fs::create_dir_all(&extract_dir)
+        .with_context(|| format!("无法创建解压目录：{}", extract_dir.display()))?;
+
+    match extension.as_str() {
+        "zip" => extract_zip_archive(input_path, &extract_dir)?,
+        "7z" => extract_7z_archive(input_path, &extract_dir)?,
+        "rar" => extract_rar_archive(input_path, &extract_dir)?,
+        _ => unreachable!(),
+    }
+
+    Ok(extract_dir)
+}
+
+fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("无法打开 ZIP 压缩包：{}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(file).context("无法读取 ZIP 压缩包")?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("无法读取 ZIP 条目：{index}"))?;
+        let Some(enclosed_name) = entry.enclosed_name() else {
+            continue;
+        };
+        let output_path = destination.join(enclosed_name);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path)
+                .with_context(|| format!("无法创建目录：{}", output_path.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("无法创建目录：{}", parent.display()))?;
+        }
+
+        let mut output = File::create(&output_path)
+            .with_context(|| format!("无法创建文件：{}", output_path.display()))?;
+        io::copy(&mut entry, &mut output)
+            .with_context(|| format!("无法解压文件：{}", output_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn extract_7z_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+    sevenz_rust::decompress_file(archive_path, destination)
+        .with_context(|| format!("无法解压 7z 压缩包：{}", archive_path.display()))
+}
+
+fn extract_rar_archive(archive_path: &Path, destination: &Path) -> Result<()> {
+    Archive::new(archive_path)
+        .open_for_processing()
+        .with_context(|| format!("无法打开 RAR 压缩包：{}", archive_path.display()))?
+        .extract_all(destination)
+        .with_context(|| format!("无法解压 RAR 压缩包：{}", archive_path.display()))
+}
+
 fn create_thumbnail(source_path: &Path, temp_dir: &Path, index: usize) -> Result<PathBuf> {
     let thumbnails_dir = temp_dir.join("thumbnails");
     fs::create_dir_all(&thumbnails_dir)
@@ -301,8 +391,12 @@ mod tests {
     use crc32fast::Hasher;
     use image::{Rgb, RgbImage};
     use std::fs;
+    use std::fs::File;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     #[test]
     fn exports_png_folder_to_xlsx() {
@@ -328,6 +422,73 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn exports_zip_archive_to_xlsx() {
+        let root = test_root("exports_zip_archive_to_xlsx");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:zip");
+
+        let archive_path = root.join("images.zip");
+        create_zip_archive(&archive_path, &png_path);
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&archive_path, &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exports_7z_archive_to_xlsx() {
+        let root = test_root("exports_7z_archive_to_xlsx");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:7z");
+
+        let archive_path = root.join("images.7z");
+        sevenz_rust::compress_to_path(&input, &archive_path).unwrap();
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&archive_path, &output, &NoopProgressSink).unwrap();
+
+        assert_eq!(summary.total_png, 1);
+        assert_eq!(summary.processed, 1);
+        assert_eq!(summary.failed, 0);
+        assert!(output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exports_rar_archive_to_xlsx() {
+        let root = test_root("exports_rar_archive_to_xlsx");
+        fs::create_dir_all(&root).unwrap();
+
+        let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("testfile.rar5-images.rar");
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&archive_path, &output, &NoopProgressSink).unwrap();
+
+        assert!(summary.total_png > 0);
+        assert_eq!(summary.processed, summary.total_png);
+        assert!(output.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_root(name: &str) -> PathBuf {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -341,6 +502,15 @@ mod tests {
     fn create_test_png(path: &Path) {
         let image = RgbImage::from_pixel(4, 4, Rgb([40, 94, 172]));
         image.save(path).unwrap();
+    }
+
+    fn create_zip_archive(archive_path: &Path, png_path: &Path) {
+        let file = File::create(archive_path).unwrap();
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        zip.start_file("nested/sample.png", options).unwrap();
+        zip.write_all(&fs::read(png_path).unwrap()).unwrap();
+        zip.finish().unwrap();
     }
 
     fn insert_text_chunk(path: &Path, keyword: &str, text: &str) {
