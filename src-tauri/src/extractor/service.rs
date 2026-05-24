@@ -211,6 +211,7 @@ pub fn run_extraction_with_options(
     let prepared_input_path = prepare_input(input_path, &temp_dir.path)?;
     let images = collect_png_files(&prepared_input_path)?;
     let total_png = images.len();
+    let output_path = prepare_output_package(output_path)?;
 
     progress.emit_progress(
         "extract:scan_complete",
@@ -231,7 +232,7 @@ pub fn run_extraction_with_options(
     let mut positive_prompt_groups = HashMap::new();
     let mut artist_string_groups = HashMap::new();
     let mut duplicate_groups = Vec::new();
-    let mut duplicate_folder_writer = DuplicateFolderWriter::new(output_path);
+    let mut duplicate_folder_writer = DuplicateFolderWriter::new(&output_path);
 
     for (index, source) in images.iter().enumerate() {
         let mut file_failed = false;
@@ -356,7 +357,7 @@ pub fn run_extraction_with_options(
         );
     }
 
-    write_xlsx(&rows, output_path).context("无法生成 Excel 工作簿")?;
+    write_xlsx(&rows, &output_path).context("无法生成 Excel 工作簿")?;
 
     progress.emit_progress(
         "extract:complete",
@@ -484,6 +485,57 @@ fn output_directory(output_path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf()
+}
+
+fn prepare_output_package(requested_output_path: &Path) -> Result<PathBuf> {
+    let parent_dir = output_directory(requested_output_path);
+    let folder_name = output_package_folder_name(requested_output_path);
+    let output_dir = create_unique_output_dir(&parent_dir, &folder_name)?;
+    let file_name = requested_output_path
+        .file_name()
+        .map(|value| sanitize_file_name(&value.to_string_lossy()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "novelai_metadata.xlsx".to_string());
+
+    Ok(output_dir.join(file_name))
+}
+
+fn output_package_folder_name(requested_output_path: &Path) -> String {
+    let folder_name = requested_output_path
+        .file_stem()
+        .map(|value| sanitize_file_name(&value.to_string_lossy()))
+        .unwrap_or_else(|| "novelai_metadata".to_string());
+    let folder_name = folder_name
+        .trim_matches(|character| character == ' ' || character == '.')
+        .to_string();
+
+    if folder_name.is_empty() {
+        "novelai_metadata".to_string()
+    } else {
+        folder_name
+    }
+}
+
+fn create_unique_output_dir(parent_dir: &Path, folder_name: &str) -> Result<PathBuf> {
+    for index in 0_usize.. {
+        let candidate_name = if index == 0 {
+            folder_name.to_string()
+        } else {
+            format!("{folder_name}_{index}")
+        };
+        let candidate_path = parent_dir.join(candidate_name);
+
+        match fs::create_dir(&candidate_path) {
+            Ok(()) => return Ok(candidate_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("无法创建输出文件夹：{}", candidate_path.display()));
+            }
+        }
+    }
+
+    unreachable!("unbounded output folder numbering should always find a candidate")
 }
 
 fn copy_source_to_duplicate_folder(
@@ -694,7 +746,10 @@ fn create_thumbnail(source_path: &Path, temp_dir: &Path, index: usize) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{run_extraction, run_extraction_with_options, ExtractionOptions, NoopProgressSink};
+    use super::{
+        run_extraction, run_extraction_with_options, ExtractionOptions, NoopProgressSink,
+        RunSummary,
+    };
     use crc32fast::Hasher;
     use image::{Rgb, RgbImage};
     use std::fs;
@@ -723,10 +778,36 @@ mod tests {
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 0);
         assert!(summary.warnings.is_empty());
-        assert!(output.exists());
-        assert!(fs::metadata(&output).unwrap().len() > 0);
-        assert_xlsx_contains(&output, &["best quality, artist:demo", "bad hands"]);
+        let actual_output = actual_output_path(&summary);
+        assert_eq!(actual_output, root.join("metadata").join("metadata.xlsx"));
+        assert!(!output.exists());
+        assert!(actual_output.exists());
+        assert!(fs::metadata(&actual_output).unwrap().len() > 0);
+        assert_xlsx_contains(&actual_output, &["best quality, artist:demo", "bad hands"]);
         assert!(!root.join("image1").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_unique_output_package_folder_when_name_exists() {
+        let root = test_root("creates_unique_output_package_folder_when_name_exists");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(root.join("metadata")).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:package");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction(&input, &output, &NoopProgressSink).unwrap();
+        let actual_output = actual_output_path(&summary);
+
+        assert_eq!(actual_output, root.join("metadata_1").join("metadata.xlsx"));
+        assert!(!output.exists());
+        assert!(actual_output.exists());
+        assert_xlsx_contains(&actual_output, &["artist:package"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -747,7 +828,10 @@ mod tests {
         assert_eq!(summary.total_png, 1);
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 0);
-        assert_xlsx_contains(&output, &["artist:nested"]);
+        let actual_output = actual_output_path(&summary);
+        assert_eq!(actual_output, root.join("metadata").join("metadata.xlsx"));
+        assert!(!output.exists());
+        assert_xlsx_contains(&actual_output, &["artist:nested"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -782,9 +866,15 @@ mod tests {
         assert_eq!(summary.processed, 2);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.skipped_duplicates, 1);
-        assert_xlsx_media_count(&output, 1);
-        assert_xlsx_contains(&output, &["same prompt, artist:first", "image1/"]);
-        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
+        let actual_output = actual_output_path(&summary);
+        let actual_output_dir = actual_output.parent().unwrap();
+        assert!(!output.exists());
+        assert_xlsx_media_count(&actual_output, 1);
+        assert_xlsx_contains(&actual_output, &["same prompt, artist:first", "image1/"]);
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join("image1"),
+            &["first.png", "second.png"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -819,9 +909,15 @@ mod tests {
         assert_eq!(summary.processed, 2);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.skipped_duplicates, 1);
-        assert_xlsx_media_count(&output, 1);
-        assert_xlsx_contains(&output, &["first prompt, artist:same", "image1/"]);
-        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
+        let actual_output = actual_output_path(&summary);
+        let actual_output_dir = actual_output.parent().unwrap();
+        assert!(!output.exists());
+        assert_xlsx_media_count(&actual_output, 1);
+        assert_xlsx_contains(&actual_output, &["first prompt, artist:same", "image1/"]);
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join("image1"),
+            &["first.png", "second.png"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -864,8 +960,11 @@ mod tests {
         assert_eq!(summary.processed, 4);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.skipped_duplicates, 2);
+        let actual_output = actual_output_path(&summary);
+        let actual_output_dir = actual_output.parent().unwrap();
+        assert!(!output.exists());
         assert_xlsx_contains(
-            &output,
+            &actual_output,
             &[
                 "prompt A, artist:first",
                 "prompt B, artist:second",
@@ -873,8 +972,14 @@ mod tests {
                 "image2/",
             ],
         );
-        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
-        assert_duplicate_folder_contains(&root.join("image2"), &["third.png", "fourth.png"]);
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join("image1"),
+            &["first.png", "second.png"],
+        );
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join("image2"),
+            &["third.png", "fourth.png"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -892,7 +997,9 @@ mod tests {
         assert_eq!(summary.processed, 0);
         assert_eq!(summary.failed, 0);
         assert!(summary.warnings.is_empty());
-        assert!(output.exists());
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -912,8 +1019,10 @@ mod tests {
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.warnings.len(), 1);
-        assert!(output.exists());
-        assert_xlsx_has_media(&output);
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
+        assert_xlsx_has_media(&actual_output);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -933,7 +1042,9 @@ mod tests {
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 1);
         assert!(!summary.warnings.is_empty());
-        assert!(output.exists());
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -957,7 +1068,9 @@ mod tests {
         assert_eq!(summary.total_png, 1);
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 0);
-        assert!(output.exists());
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -981,7 +1094,9 @@ mod tests {
         assert_eq!(summary.total_png, 1);
         assert_eq!(summary.processed, 1);
         assert_eq!(summary.failed, 0);
-        assert!(output.exists());
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1000,7 +1115,9 @@ mod tests {
 
         assert!(summary.total_png > 0);
         assert_eq!(summary.processed, summary.total_png);
-        assert!(output.exists());
+        let actual_output = actual_output_path(&summary);
+        assert!(!output.exists());
+        assert!(actual_output.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1027,6 +1144,10 @@ mod tests {
         zip.start_file("nested/sample.png", options).unwrap();
         zip.write_all(&fs::read(png_path).unwrap()).unwrap();
         zip.finish().unwrap();
+    }
+
+    fn actual_output_path(summary: &RunSummary) -> PathBuf {
+        PathBuf::from(&summary.output_path)
     }
 
     fn assert_xlsx_contains(output: &Path, expected_text: &[&str]) {
