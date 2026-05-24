@@ -96,6 +96,12 @@ struct DuplicateFolderWriter {
     next_folder_number: usize,
 }
 
+struct FailureFolderWriter {
+    output_dir: PathBuf,
+    folder_path: Option<PathBuf>,
+    copied_count: usize,
+}
+
 impl DuplicateFolderWriter {
     fn new(output_path: &Path) -> Self {
         Self {
@@ -114,11 +120,12 @@ impl DuplicateFolderWriter {
         }
 
         let (folder_name, folder_path) = self.create_folder()?;
-        copy_source_to_duplicate_folder(
+        copy_source_to_numbered_folder(
             &group.representative_path,
             &group.representative_display_path,
             &folder_path,
             &mut group.copied_count,
+            "重复图片",
         )?;
 
         rows[group.row_index].duplicate_folder = format!("{folder_name}/");
@@ -141,6 +148,40 @@ impl DuplicateFolderWriter {
                 .with_context(|| format!("无法创建重复图片文件夹：{}", folder_path.display()))?;
             return Ok((folder_name, folder_path));
         }
+    }
+}
+
+impl FailureFolderWriter {
+    fn new(output_path: &Path) -> Self {
+        Self {
+            output_dir: output_directory(output_path),
+            folder_path: None,
+            copied_count: 0,
+        }
+    }
+
+    fn copy_failed_source(&mut self, source: &SourceImage) -> Result<()> {
+        let folder_path = self.ensure_folder()?;
+        copy_source_to_numbered_folder(
+            &source.absolute_path,
+            &source.display_path,
+            &folder_path,
+            &mut self.copied_count,
+            "失败图片",
+        )
+    }
+
+    fn ensure_folder(&mut self) -> Result<PathBuf> {
+        if let Some(folder_path) = &self.folder_path {
+            return Ok(folder_path.clone());
+        }
+
+        let folder_path = self.output_dir.join("_Fail");
+        fs::create_dir(&folder_path)
+            .with_context(|| format!("无法创建失败图片文件夹：{}", folder_path.display()))?;
+        self.folder_path = Some(folder_path.clone());
+
+        Ok(folder_path)
     }
 }
 
@@ -233,6 +274,7 @@ pub fn run_extraction_with_options(
     let mut artist_string_groups = HashMap::new();
     let mut duplicate_groups = Vec::new();
     let mut duplicate_folder_writer = DuplicateFolderWriter::new(&output_path);
+    let mut failure_folder_writer = FailureFolderWriter::new(&output_path);
 
     for (index, source) in images.iter().enumerate() {
         let mut file_failed = false;
@@ -275,15 +317,17 @@ pub fn run_extraction_with_options(
 
             {
                 let group = &mut duplicate_groups[duplicate.group_index];
-                copy_source_to_duplicate_folder(
+                copy_source_to_numbered_folder(
                     &source.absolute_path,
                     &source.display_path,
                     &folder_path,
                     &mut group.copied_count,
+                    "重复图片",
                 )?;
             }
 
             if file_failed {
+                failure_folder_writer.copy_failed_source(source)?;
                 failed += 1;
             }
 
@@ -341,6 +385,7 @@ pub fn run_extraction_with_options(
         }
 
         if file_failed {
+            failure_folder_writer.copy_failed_source(source)?;
             failed += 1;
         }
 
@@ -538,11 +583,12 @@ fn create_unique_output_dir(parent_dir: &Path, folder_name: &str) -> Result<Path
     unreachable!("unbounded output folder numbering should always find a candidate")
 }
 
-fn copy_source_to_duplicate_folder(
+fn copy_source_to_numbered_folder(
     source_path: &Path,
     display_path: &str,
     folder_path: &Path,
     copied_count: &mut usize,
+    item_label: &str,
 ) -> Result<()> {
     *copied_count += 1;
 
@@ -555,7 +601,8 @@ fn copy_source_to_duplicate_folder(
 
     fs::copy(source_path, &target_path).with_context(|| {
         format!(
-            "无法复制重复图片 {} 到 {}",
+            "无法复制{} {} 到 {}",
+            item_label,
             display_path,
             target_path.display()
         )
@@ -785,6 +832,7 @@ mod tests {
         assert!(fs::metadata(&actual_output).unwrap().len() > 0);
         assert_xlsx_contains(&actual_output, &["best quality, artist:demo", "bad hands"]);
         assert!(!root.join("image1").exists());
+        assert!(!actual_output.parent().unwrap().join("_Fail").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1023,6 +1071,10 @@ mod tests {
         assert!(!output.exists());
         assert!(actual_output.exists());
         assert_xlsx_has_media(&actual_output);
+        assert_duplicate_folder_contains(
+            &actual_output.parent().unwrap().join("_Fail"),
+            &["plain.png"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1045,6 +1097,10 @@ mod tests {
         let actual_output = actual_output_path(&summary);
         assert!(!output.exists());
         assert!(actual_output.exists());
+        assert_duplicate_folder_contains(
+            &actual_output.parent().unwrap().join("_Fail"),
+            &["broken.png"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
