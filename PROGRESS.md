@@ -62,3 +62,4 @@
 - 2026-05-23：为 Windows release 入口添加 GUI 子系统声明，避免启动 `.exe` 时显示控制台窗口。
 - 2026-05-24：新增正面提示词/画师串导出去重开关；验证 `cargo test` 18 个测试全部通过，`npm.cmd run build` 和 `npm.cmd run tauri:build` 通过。
 - 2026-05-24：新增重复图片自动编号目录输出和 XLSX“重复文件夹”列；验证 `cargo test` 19 个测试全部通过，`npm.cmd run build` 通过。
+- 2026-05-24：将输出按钮文案从“选择 .xlsx 保存路径”调整为“选择输出路径”；验证 `npm.cmd run tauri:build` 通过。

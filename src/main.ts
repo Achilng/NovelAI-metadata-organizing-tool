@@ -63,7 +63,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <section class="panel">
       <div class="section-title">输出</div>
       <div class="row">
-        <button id="choose-output" type="button">选择 .xlsx 保存路径</button>
+        <button id="choose-output" type="button">选择输出路径</button>
         <output id="output-path" class="path">未选择</output>
       </div>
     </section>
