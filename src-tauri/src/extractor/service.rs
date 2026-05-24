@@ -3,7 +3,7 @@ use super::png_text::read_png_text_chunks;
 use super::xlsx::{write_xlsx, WorkbookRow};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -74,6 +74,74 @@ struct SourceImage {
 pub struct ExtractionOptions {
     pub dedupe_positive_prompt: bool,
     pub dedupe_artist_tags: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DuplicateMatch {
+    group_index: usize,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct DuplicateGroup {
+    row_index: usize,
+    representative_path: PathBuf,
+    representative_display_path: String,
+    folder_name: Option<String>,
+    copied_count: usize,
+}
+
+struct DuplicateFolderWriter {
+    output_dir: PathBuf,
+    next_folder_number: usize,
+}
+
+impl DuplicateFolderWriter {
+    fn new(output_path: &Path) -> Self {
+        Self {
+            output_dir: output_directory(output_path),
+            next_folder_number: 1,
+        }
+    }
+
+    fn ensure_folder(
+        &mut self,
+        group: &mut DuplicateGroup,
+        rows: &mut [WorkbookRow],
+    ) -> Result<PathBuf> {
+        if let Some(folder_name) = &group.folder_name {
+            return Ok(self.output_dir.join(folder_name));
+        }
+
+        let (folder_name, folder_path) = self.create_folder()?;
+        copy_source_to_duplicate_folder(
+            &group.representative_path,
+            &group.representative_display_path,
+            &folder_path,
+            &mut group.copied_count,
+        )?;
+
+        rows[group.row_index].duplicate_folder = format!("{folder_name}/");
+        group.folder_name = Some(folder_name);
+
+        Ok(folder_path)
+    }
+
+    fn create_folder(&mut self) -> Result<(String, PathBuf)> {
+        loop {
+            let folder_name = format!("image{}", self.next_folder_number);
+            self.next_folder_number += 1;
+            let folder_path = self.output_dir.join(&folder_name);
+
+            if folder_path.exists() {
+                continue;
+            }
+
+            fs::create_dir(&folder_path)
+                .with_context(|| format!("无法创建重复图片文件夹：{}", folder_path.display()))?;
+            return Ok((folder_name, folder_path));
+        }
+    }
 }
 
 struct RunTempDir {
@@ -160,8 +228,10 @@ pub fn run_extraction_with_options(
     let mut warnings = Vec::new();
     let mut failed = 0_usize;
     let mut skipped_duplicates = 0_usize;
-    let mut seen_positive_prompts = HashSet::new();
-    let mut seen_artist_strings = HashSet::new();
+    let mut positive_prompt_groups = HashMap::new();
+    let mut artist_string_groups = HashMap::new();
+    let mut duplicate_groups = Vec::new();
+    let mut duplicate_folder_writer = DuplicateFolderWriter::new(output_path);
 
     for (index, source) in images.iter().enumerate() {
         let mut file_failed = false;
@@ -188,14 +258,29 @@ pub fn run_extraction_with_options(
             warnings.push(warning);
         }
 
-        if let Some(reason) = duplicate_reason(
+        if let Some(duplicate) = duplicate_match(
             &metadata.positive_prompt,
             &metadata.artist_tags,
             options,
-            &seen_positive_prompts,
-            &seen_artist_strings,
+            &positive_prompt_groups,
+            &artist_string_groups,
         ) {
             skipped_duplicates += 1;
+
+            let folder_path = {
+                let group = &mut duplicate_groups[duplicate.group_index];
+                duplicate_folder_writer.ensure_folder(group, &mut rows)?
+            };
+
+            {
+                let group = &mut duplicate_groups[duplicate.group_index];
+                copy_source_to_duplicate_folder(
+                    &source.absolute_path,
+                    &source.display_path,
+                    &folder_path,
+                    &mut group.copied_count,
+                )?;
+            }
 
             if file_failed {
                 failed += 1;
@@ -214,7 +299,7 @@ pub fn run_extraction_with_options(
                         index + 1,
                         total_png,
                         skipped_duplicates,
-                        reason
+                        duplicate.reason
                     )),
                 },
             );
@@ -223,12 +308,16 @@ pub fn run_extraction_with_options(
 
         match create_thumbnail(&source.absolute_path, &temp_dir.path, index) {
             Ok(thumbnail_path) => {
-                remember_dedup_keys(
+                let row_index = rows.len();
+                remember_dedup_group(
+                    source,
+                    row_index,
                     &metadata.positive_prompt,
                     &metadata.artist_tags,
                     options,
-                    &mut seen_positive_prompts,
-                    &mut seen_artist_strings,
+                    &mut duplicate_groups,
+                    &mut positive_prompt_groups,
+                    &mut artist_string_groups,
                 );
                 rows.push(WorkbookRow {
                     thumbnail_path,
@@ -236,6 +325,7 @@ pub fn run_extraction_with_options(
                     positive_prompt: metadata.positive_prompt,
                     negative_prompt: metadata.negative_prompt,
                     artist_tags: metadata.artist_tags,
+                    duplicate_folder: String::new(),
                 });
             }
             Err(error) => {
@@ -290,25 +380,31 @@ pub fn run_extraction_with_options(
     })
 }
 
-fn duplicate_reason(
+fn duplicate_match(
     positive_prompt: &str,
     artist_tags: &[String],
     options: ExtractionOptions,
-    seen_positive_prompts: &HashSet<String>,
-    seen_artist_strings: &HashSet<String>,
-) -> Option<&'static str> {
+    positive_prompt_groups: &HashMap<String, usize>,
+    artist_string_groups: &HashMap<String, usize>,
+) -> Option<DuplicateMatch> {
     if options.dedupe_positive_prompt {
         if let Some(key) = positive_prompt_key(positive_prompt) {
-            if seen_positive_prompts.contains(&key) {
-                return Some("正面提示词重复");
+            if let Some(group_index) = positive_prompt_groups.get(&key) {
+                return Some(DuplicateMatch {
+                    group_index: *group_index,
+                    reason: "正面提示词重复",
+                });
             }
         }
     }
 
     if options.dedupe_artist_tags {
         if let Some(key) = artist_tags_key(artist_tags) {
-            if seen_artist_strings.contains(&key) {
-                return Some("画师串重复");
+            if let Some(group_index) = artist_string_groups.get(&key) {
+                return Some(DuplicateMatch {
+                    group_index: *group_index,
+                    reason: "画师串重复",
+                });
             }
         }
     }
@@ -316,22 +412,47 @@ fn duplicate_reason(
     None
 }
 
-fn remember_dedup_keys(
+fn remember_dedup_group(
+    source: &SourceImage,
+    row_index: usize,
     positive_prompt: &str,
     artist_tags: &[String],
     options: ExtractionOptions,
-    seen_positive_prompts: &mut HashSet<String>,
-    seen_artist_strings: &mut HashSet<String>,
+    duplicate_groups: &mut Vec<DuplicateGroup>,
+    positive_prompt_groups: &mut HashMap<String, usize>,
+    artist_string_groups: &mut HashMap<String, usize>,
 ) {
+    let positive_key = options
+        .dedupe_positive_prompt
+        .then(|| positive_prompt_key(positive_prompt))
+        .flatten();
+    let artist_key = options
+        .dedupe_artist_tags
+        .then(|| artist_tags_key(artist_tags))
+        .flatten();
+
+    if positive_key.is_none() && artist_key.is_none() {
+        return;
+    }
+
+    let group_index = duplicate_groups.len();
+    duplicate_groups.push(DuplicateGroup {
+        row_index,
+        representative_path: source.absolute_path.clone(),
+        representative_display_path: source.display_path.clone(),
+        folder_name: None,
+        copied_count: 0,
+    });
+
     if options.dedupe_positive_prompt {
-        if let Some(key) = positive_prompt_key(positive_prompt) {
-            seen_positive_prompts.insert(key);
+        if let Some(key) = positive_key {
+            positive_prompt_groups.insert(key, group_index);
         }
     }
 
     if options.dedupe_artist_tags {
-        if let Some(key) = artist_tags_key(artist_tags) {
-            seen_artist_strings.insert(key);
+        if let Some(key) = artist_key {
+            artist_string_groups.insert(key, group_index);
         }
     }
 }
@@ -355,6 +476,51 @@ fn artist_tags_key(values: &[String]) -> Option<String> {
 fn non_empty_key(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn output_directory(output_path: &Path) -> PathBuf {
+    output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn copy_source_to_duplicate_folder(
+    source_path: &Path,
+    display_path: &str,
+    folder_path: &Path,
+    copied_count: &mut usize,
+) -> Result<()> {
+    *copied_count += 1;
+
+    let source_file_name = source_path
+        .file_name()
+        .map(|value| sanitize_file_name(&value.to_string_lossy()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "image.png".to_string());
+    let target_path = folder_path.join(format!("{:04}_{source_file_name}", *copied_count));
+
+    fs::copy(source_path, &target_path).with_context(|| {
+        format!(
+            "无法复制重复图片 {} 到 {}",
+            display_path,
+            target_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            _ if character.is_control() => '_',
+            _ => character,
+        })
+        .collect()
 }
 
 fn validate_paths(input_path: &Path, output_path: &Path) -> Result<()> {
@@ -560,6 +726,7 @@ mod tests {
         assert!(output.exists());
         assert!(fs::metadata(&output).unwrap().len() > 0);
         assert_xlsx_contains(&output, &["best quality, artist:demo", "bad hands"]);
+        assert!(!root.join("image1").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -616,7 +783,8 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.skipped_duplicates, 1);
         assert_xlsx_media_count(&output, 1);
-        assert_xlsx_contains(&output, &["same prompt, artist:first"]);
+        assert_xlsx_contains(&output, &["same prompt, artist:first", "image1/"]);
+        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -652,7 +820,61 @@ mod tests {
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.skipped_duplicates, 1);
         assert_xlsx_media_count(&output, 1);
-        assert_xlsx_contains(&output, &["first prompt, artist:same"]);
+        assert_xlsx_contains(&output, &["first prompt, artist:same", "image1/"]);
+        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn creates_numbered_duplicate_folders_per_duplicate_group() {
+        let root = test_root("creates_numbered_duplicate_folders_per_duplicate_group");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "prompt A, artist:first");
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "prompt A, artist:first");
+
+        let third_png = input.join("third.png");
+        create_test_png(&third_png);
+        insert_text_chunk(&third_png, "Description", "prompt B, artist:second");
+
+        let fourth_png = input.join("fourth.png");
+        create_test_png(&fourth_png);
+        insert_text_chunk(&fourth_png, "Description", "prompt B, artist:second");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction_with_options(
+            &input,
+            &output,
+            ExtractionOptions {
+                dedupe_positive_prompt: true,
+                dedupe_artist_tags: false,
+            },
+            &NoopProgressSink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_png, 4);
+        assert_eq!(summary.processed, 4);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped_duplicates, 2);
+        assert_xlsx_contains(
+            &output,
+            &[
+                "prompt A, artist:first",
+                "prompt B, artist:second",
+                "image1/",
+                "image2/",
+            ],
+        );
+        assert_duplicate_folder_contains(&root.join("image1"), &["first.png", "second.png"]);
+        assert_duplicate_folder_contains(&root.join("image2"), &["third.png", "fourth.png"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -847,6 +1069,32 @@ mod tests {
             .count();
 
         assert_eq!(media_count, expected_count);
+    }
+
+    fn assert_duplicate_folder_contains(folder: &Path, expected_file_names: &[&str]) {
+        assert!(
+            folder.is_dir(),
+            "{} should be a directory",
+            folder.display()
+        );
+
+        let copied_files = fs::read_dir(folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(copied_files.len(), expected_file_names.len());
+        for expected_file_name in expected_file_names {
+            assert!(
+                copied_files
+                    .iter()
+                    .any(|copied_file| copied_file.ends_with(expected_file_name)),
+                "{} should contain a copied {} entry, got {:?}",
+                folder.display(),
+                expected_file_name,
+                copied_files
+            );
+        }
     }
 
     fn insert_text_chunk(path: &Path, keyword: &str, text: &str) {

@@ -12,6 +12,7 @@ pub struct WorkbookRow {
     pub positive_prompt: String,
     pub negative_prompt: String,
     pub artist_tags: Vec<String>,
+    pub duplicate_folder: String,
 }
 
 pub fn write_xlsx(rows: &[WorkbookRow], output_path: &Path) -> Result<()> {
@@ -32,12 +33,14 @@ pub fn write_xlsx(rows: &[WorkbookRow], output_path: &Path) -> Result<()> {
         worksheet.set_column_width(1, 64)?;
         worksheet.set_column_width(2, 48)?;
         worksheet.set_column_width(3, 34)?;
+        worksheet.set_column_width(4, 18)?;
         worksheet.set_row_height_pixels(0, 28)?;
 
         worksheet.write_string_with_format(0, 0, "图片", &header_format)?;
         worksheet.write_string_with_format(0, 1, "正向提示词", &header_format)?;
         worksheet.write_string_with_format(0, 2, "负向提示词", &header_format)?;
         worksheet.write_string_with_format(0, 3, "画师串", &header_format)?;
+        worksheet.write_string_with_format(0, 4, "重复文件夹", &header_format)?;
 
         for (index, row) in rows.iter().enumerate() {
             let row_number = (index + 1) as u32;
@@ -66,6 +69,14 @@ pub fn write_xlsx(rows: &[WorkbookRow], output_path: &Path) -> Result<()> {
                 truncate_for_excel(&row.artist_tags.join("\n")),
                 &text_format,
             )?;
+            if !row.duplicate_folder.is_empty() {
+                worksheet.write_string_with_format(
+                    row_number,
+                    4,
+                    truncate_for_excel(&row.duplicate_folder),
+                    &text_format,
+                )?;
+            }
         }
     }
 
