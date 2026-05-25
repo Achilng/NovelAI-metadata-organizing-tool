@@ -1898,6 +1898,7 @@ name = "novelai-metadata-organizing-tool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crc32fast",
  "flate2",
  "image",

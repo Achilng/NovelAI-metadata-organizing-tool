@@ -32,6 +32,7 @@ const state = {
   isRunning: false,
   dedupePositivePrompt: false,
   dedupeArtistTags: false,
+  sortByTime: false,
   processed: 0,
   failed: 0,
   skippedDuplicates: 0,
@@ -69,7 +70,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     </section>
 
     <section class="panel">
-      <div class="section-title">去重选项</div>
+      <div class="section-title">整理选项</div>
       <div class="options-grid">
         <label class="toggle-option">
           <input id="dedupe-positive-prompt" type="checkbox" />
@@ -78,6 +79,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <label class="toggle-option">
           <input id="dedupe-artist-tags" type="checkbox" />
           <span>画师串去重</span>
+        </label>
+        <label class="toggle-option">
+          <input id="sort-by-time" type="checkbox" />
+          <span>按时间升序整理</span>
         </label>
       </div>
     </section>
@@ -121,6 +126,7 @@ const dedupePositivePromptCheckbox = document.querySelector<HTMLInputElement>(
   "#dedupe-positive-prompt"
 )!;
 const dedupeArtistTagsCheckbox = document.querySelector<HTMLInputElement>("#dedupe-artist-tags")!;
+const sortByTimeCheckbox = document.querySelector<HTMLInputElement>("#sort-by-time")!;
 const inputPathOutput = document.querySelector<HTMLOutputElement>("#input-path")!;
 const outputPathOutput = document.querySelector<HTMLOutputElement>("#output-path")!;
 const statusMessage = document.querySelector<HTMLParagraphElement>("#status-message")!;
@@ -154,6 +160,8 @@ function render() {
   dedupePositivePromptCheckbox.disabled = state.isRunning;
   dedupeArtistTagsCheckbox.checked = state.dedupeArtistTags;
   dedupeArtistTagsCheckbox.disabled = state.isRunning;
+  sortByTimeCheckbox.checked = state.sortByTime;
+  sortByTimeCheckbox.disabled = state.isRunning;
 
   warnings.innerHTML = "";
   if (state.warnings.length === 0) {
@@ -220,6 +228,11 @@ dedupeArtistTagsCheckbox.addEventListener("change", () => {
   render();
 });
 
+sortByTimeCheckbox.addEventListener("change", () => {
+  state.sortByTime = sortByTimeCheckbox.checked;
+  render();
+});
+
 startButton.addEventListener("click", async () => {
   if (!state.inputPath || !state.outputPath || state.isRunning) {
     return;
@@ -240,7 +253,8 @@ startButton.addEventListener("click", async () => {
       inputPath: state.inputPath,
       outputPath: state.outputPath,
       dedupePositivePrompt: state.dedupePositivePrompt,
-      dedupeArtistTags: state.dedupeArtistTags
+      dedupeArtistTags: state.dedupeArtistTags,
+      sortByTime: state.sortByTime
     });
     state.total = summary.total_png;
     state.processed = summary.processed;

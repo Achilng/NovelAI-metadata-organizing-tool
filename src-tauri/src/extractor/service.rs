@@ -2,7 +2,9 @@ use super::metadata::parse_novelai_metadata;
 use super::png_text::read_png_text_chunks;
 use super::xlsx::{write_xlsx, WorkbookRow};
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Local};
 use serde::Serialize;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -16,6 +18,7 @@ use zip::ZipArchive;
 
 const THUMBNAIL_SIZE: u32 = 160;
 const TEMP_ROOT: &str = r"D:\Agent\Agent_temp";
+const MISSING_TIME_FOLDER_PREFIX: &str = "9999-12-31_235959";
 static RUN_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,12 +71,14 @@ impl ProgressSink for NoopProgressSink {}
 struct SourceImage {
     absolute_path: PathBuf,
     display_path: String,
+    sort_time: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtractionOptions {
     pub dedupe_positive_prompt: bool,
     pub dedupe_artist_tags: bool,
+    pub sort_by_time: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +92,8 @@ struct DuplicateGroup {
     row_index: usize,
     representative_path: PathBuf,
     representative_display_path: String,
+    duplicate_sources: Vec<SourceImage>,
+    sort_time: Option<SystemTime>,
     folder_name: Option<String>,
     copied_count: usize,
 }
@@ -98,7 +105,8 @@ struct DuplicateFolderWriter {
 
 struct FailureFolderWriter {
     output_dir: PathBuf,
-    folder_path: Option<PathBuf>,
+    failed_sources: Vec<SourceImage>,
+    sort_time: Option<SystemTime>,
     copied_count: usize,
 }
 
@@ -110,34 +118,51 @@ impl DuplicateFolderWriter {
         }
     }
 
-    fn ensure_folder(
+    fn write_duplicate_folders(
         &mut self,
-        group: &mut DuplicateGroup,
+        groups: &mut [DuplicateGroup],
         rows: &mut [WorkbookRow],
-    ) -> Result<PathBuf> {
-        if let Some(folder_name) = &group.folder_name {
-            return Ok(self.output_dir.join(folder_name));
+        sort_by_time: bool,
+    ) -> Result<()> {
+        for group in groups
+            .iter_mut()
+            .filter(|group| !group.duplicate_sources.is_empty())
+        {
+            let (folder_name, folder_path) = self.create_folder(group.sort_time, sort_by_time)?;
+            copy_source_to_numbered_folder(
+                &group.representative_path,
+                &group.representative_display_path,
+                &folder_path,
+                &mut group.copied_count,
+                "重复图片",
+            )?;
+
+            for source in &group.duplicate_sources {
+                copy_source_to_numbered_folder(
+                    &source.absolute_path,
+                    &source.display_path,
+                    &folder_path,
+                    &mut group.copied_count,
+                    "重复图片",
+                )?;
+            }
+
+            rows[group.row_index].duplicate_folder = format!("{folder_name}/");
+            group.folder_name = Some(folder_name);
         }
 
-        let (folder_name, folder_path) = self.create_folder()?;
-        copy_source_to_numbered_folder(
-            &group.representative_path,
-            &group.representative_display_path,
-            &folder_path,
-            &mut group.copied_count,
-            "重复图片",
-        )?;
-
-        rows[group.row_index].duplicate_folder = format!("{folder_name}/");
-        group.folder_name = Some(folder_name);
-
-        Ok(folder_path)
+        Ok(())
     }
 
-    fn create_folder(&mut self) -> Result<(String, PathBuf)> {
+    fn create_folder(
+        &mut self,
+        sort_time: Option<SystemTime>,
+        sort_by_time: bool,
+    ) -> Result<(String, PathBuf)> {
         loop {
-            let folder_name = format!("image{}", self.next_folder_number);
+            let base_folder_name = format!("image{}", self.next_folder_number);
             self.next_folder_number += 1;
+            let folder_name = output_folder_name(&base_folder_name, sort_time, sort_by_time);
             let folder_path = self.output_dir.join(&folder_name);
 
             if folder_path.exists() {
@@ -155,33 +180,39 @@ impl FailureFolderWriter {
     fn new(output_path: &Path) -> Self {
         Self {
             output_dir: output_directory(output_path),
-            folder_path: None,
+            failed_sources: Vec::new(),
+            sort_time: None,
             copied_count: 0,
         }
     }
 
-    fn copy_failed_source(&mut self, source: &SourceImage) -> Result<()> {
-        let folder_path = self.ensure_folder()?;
-        copy_source_to_numbered_folder(
-            &source.absolute_path,
-            &source.display_path,
-            &folder_path,
-            &mut self.copied_count,
-            "失败图片",
-        )
+    fn remember_failed_source(&mut self, source: &SourceImage) {
+        self.sort_time = earliest_sort_time(self.sort_time, source.sort_time);
+        self.failed_sources.push(source.clone());
     }
 
-    fn ensure_folder(&mut self) -> Result<PathBuf> {
-        if let Some(folder_path) = &self.folder_path {
-            return Ok(folder_path.clone());
+    fn write_failed_sources(&mut self, sort_by_time: bool) -> Result<()> {
+        if self.failed_sources.is_empty() {
+            return Ok(());
         }
 
-        let folder_path = self.output_dir.join("_Fail");
+        let base_folder_name = if sort_by_time { "Fail" } else { "_Fail" };
+        let folder_name = output_folder_name(base_folder_name, self.sort_time, sort_by_time);
+        let folder_path = self.output_dir.join(folder_name);
         fs::create_dir(&folder_path)
             .with_context(|| format!("无法创建失败图片文件夹：{}", folder_path.display()))?;
-        self.folder_path = Some(folder_path.clone());
 
-        Ok(folder_path)
+        for source in &self.failed_sources {
+            copy_source_to_numbered_folder(
+                &source.absolute_path,
+                &source.display_path,
+                &folder_path,
+                &mut self.copied_count,
+                "失败图片",
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -266,13 +297,13 @@ pub fn run_extraction_with_options(
         },
     );
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<WorkbookRow> = Vec::new();
     let mut warnings = Vec::new();
     let mut failed = 0_usize;
     let mut skipped_duplicates = 0_usize;
     let mut positive_prompt_groups = HashMap::new();
     let mut artist_string_groups = HashMap::new();
-    let mut duplicate_groups = Vec::new();
+    let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
     let mut duplicate_folder_writer = DuplicateFolderWriter::new(&output_path);
     let mut failure_folder_writer = FailureFolderWriter::new(&output_path);
 
@@ -310,24 +341,12 @@ pub fn run_extraction_with_options(
         ) {
             skipped_duplicates += 1;
 
-            let folder_path = {
-                let group = &mut duplicate_groups[duplicate.group_index];
-                duplicate_folder_writer.ensure_folder(group, &mut rows)?
-            };
-
-            {
-                let group = &mut duplicate_groups[duplicate.group_index];
-                copy_source_to_numbered_folder(
-                    &source.absolute_path,
-                    &source.display_path,
-                    &folder_path,
-                    &mut group.copied_count,
-                    "重复图片",
-                )?;
-            }
+            let group = &mut duplicate_groups[duplicate.group_index];
+            group.sort_time = earliest_sort_time(group.sort_time, source.sort_time);
+            group.duplicate_sources.push(source.clone());
 
             if file_failed {
-                failure_folder_writer.copy_failed_source(source)?;
+                failure_folder_writer.remember_failed_source(source);
                 failed += 1;
             }
 
@@ -367,6 +386,8 @@ pub fn run_extraction_with_options(
                 rows.push(WorkbookRow {
                     thumbnail_path,
                     source_path: source.display_path.clone(),
+                    sort_time: source.sort_time,
+                    sort_time_text: format_time_for_xlsx(source.sort_time),
                     positive_prompt: metadata.positive_prompt,
                     negative_prompt: metadata.negative_prompt,
                     artist_tags: metadata.artist_tags,
@@ -385,7 +406,7 @@ pub fn run_extraction_with_options(
         }
 
         if file_failed {
-            failure_folder_writer.copy_failed_source(source)?;
+            failure_folder_writer.remember_failed_source(source);
             failed += 1;
         }
 
@@ -402,7 +423,18 @@ pub fn run_extraction_with_options(
         );
     }
 
-    write_xlsx(&rows, &output_path).context("无法生成 Excel 工作簿")?;
+    duplicate_folder_writer
+        .write_duplicate_folders(&mut duplicate_groups, &mut rows, options.sort_by_time)
+        .context("无法写入重复图片文件夹")?;
+    failure_folder_writer
+        .write_failed_sources(options.sort_by_time)
+        .context("无法写入失败图片文件夹")?;
+
+    if options.sort_by_time {
+        sort_rows_by_time(&mut rows);
+    }
+
+    write_xlsx(&rows, &output_path, options.sort_by_time).context("无法生成 Excel 工作簿")?;
 
     progress.emit_progress(
         "extract:complete",
@@ -486,6 +518,8 @@ fn remember_dedup_group(
         row_index,
         representative_path: source.absolute_path.clone(),
         representative_display_path: source.display_path.clone(),
+        duplicate_sources: Vec::new(),
+        sort_time: source.sort_time,
         folder_name: None,
         copied_count: 0,
     });
@@ -530,6 +564,72 @@ fn output_directory(output_path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf()
+}
+
+fn output_folder_name(
+    base_name: &str,
+    sort_time: Option<SystemTime>,
+    sort_by_time: bool,
+) -> String {
+    if sort_by_time {
+        format!("{}_{}", format_time_for_folder_prefix(sort_time), base_name)
+    } else {
+        base_name.to_string()
+    }
+}
+
+fn earliest_sort_time(
+    current: Option<SystemTime>,
+    candidate: Option<SystemTime>,
+) -> Option<SystemTime> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(if candidate < current {
+            candidate
+        } else {
+            current
+        }),
+        (None, Some(candidate)) => Some(candidate),
+        (Some(current), None) => Some(current),
+        (None, None) => None,
+    }
+}
+
+fn sort_rows_by_time(rows: &mut [WorkbookRow]) {
+    rows.sort_by(|left, right| {
+        compare_optional_time(left.sort_time, right.sort_time)
+            .then_with(|| left.source_path.cmp(&right.source_path))
+    });
+}
+
+fn compare_optional_time(left: Option<SystemTime>, right: Option<SystemTime>) -> CmpOrdering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(CmpOrdering::Equal),
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
+    }
+}
+
+fn format_time_for_xlsx(sort_time: Option<SystemTime>) -> String {
+    sort_time
+        .map(format_local_time_for_xlsx)
+        .unwrap_or_default()
+}
+
+fn format_time_for_folder_prefix(sort_time: Option<SystemTime>) -> String {
+    sort_time
+        .map(format_local_time_for_folder_prefix)
+        .unwrap_or_else(|| MISSING_TIME_FOLDER_PREFIX.to_string())
+}
+
+fn format_local_time_for_xlsx(sort_time: SystemTime) -> String {
+    let datetime: DateTime<Local> = sort_time.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn format_local_time_for_folder_prefix(sort_time: SystemTime) -> String {
+    let datetime: DateTime<Local> = sort_time.into();
+    datetime.format("%Y-%m-%d_%H%M%S").to_string()
 }
 
 fn prepare_output_package(requested_output_path: &Path) -> Result<PathBuf> {
@@ -647,13 +747,11 @@ fn validate_paths(input_path: &Path, output_path: &Path) -> Result<()> {
 fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
     if input_path.is_file() {
         if is_png(input_path) {
-            return Ok(vec![SourceImage {
-                absolute_path: input_path.to_path_buf(),
-                display_path: input_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| input_path.display().to_string()),
-            }]);
+            let display_path = input_path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| input_path.display().to_string());
+            return Ok(vec![source_image(input_path, display_path)]);
         }
 
         if is_supported_archive(input_path) {
@@ -681,14 +779,25 @@ fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
             .display()
             .to_string();
 
-        images.push(SourceImage {
-            absolute_path: entry.path().to_path_buf(),
-            display_path,
-        });
+        images.push(source_image(entry.path(), display_path));
     }
 
     images.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     Ok(images)
+}
+
+fn source_image(path: &Path, display_path: String) -> SourceImage {
+    SourceImage {
+        absolute_path: path.to_path_buf(),
+        display_path,
+        sort_time: file_creation_time(path),
+    }
+}
+
+fn file_creation_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
 }
 
 fn is_png(path: &Path) -> bool {
@@ -793,9 +902,10 @@ fn create_thumbnail(source_path: &Path, temp_dir: &Path, index: usize) -> Result
 
 #[cfg(test)]
 mod tests {
+    use super::super::xlsx::WorkbookRow;
     use super::{
-        run_extraction, run_extraction_with_options, ExtractionOptions, NoopProgressSink,
-        RunSummary,
+        output_folder_name, run_extraction, run_extraction_with_options, sort_rows_by_time,
+        ExtractionOptions, NoopProgressSink, RunSummary,
     };
     use crc32fast::Hasher;
     use image::{Rgb, RgbImage};
@@ -803,7 +913,7 @@ mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -885,6 +995,88 @@ mod tests {
     }
 
     #[test]
+    fn sorts_rows_by_time_with_missing_values_last() {
+        let early = UNIX_EPOCH + Duration::from_secs(10);
+        let late = UNIX_EPOCH + Duration::from_secs(20);
+        let mut rows = vec![
+            workbook_row("missing.png", None),
+            workbook_row("late.png", Some(late)),
+            workbook_row("early.png", Some(early)),
+        ];
+
+        sort_rows_by_time(&mut rows);
+
+        let ordered_sources = rows
+            .iter()
+            .map(|row| row.source_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_sources,
+            vec!["early.png", "late.png", "missing.png"]
+        );
+    }
+
+    #[test]
+    fn sorting_option_adds_time_column_and_prefixes_duplicate_folder() {
+        let root = test_root("sorting_option_adds_time_column_and_prefixes_duplicate_folder");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "same prompt, artist:sorted");
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "same prompt, artist:sorted");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction_with_options(
+            &input,
+            &output,
+            ExtractionOptions {
+                dedupe_positive_prompt: true,
+                dedupe_artist_tags: false,
+                sort_by_time: true,
+            },
+            &NoopProgressSink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_png, 2);
+        assert_eq!(summary.skipped_duplicates, 1);
+        let actual_output = actual_output_path(&summary);
+        let actual_output_dir = actual_output.parent().unwrap();
+        let duplicate_folder_name = find_output_subdir(actual_output_dir, "image1");
+        assert_sorted_folder_name(&duplicate_folder_name, "image1");
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join(&duplicate_folder_name),
+            &["first.png", "second.png"],
+        );
+
+        let duplicate_folder_cell = format!("{duplicate_folder_name}/");
+        assert_xlsx_contains(
+            &actual_output,
+            &[
+                "时间",
+                duplicate_folder_cell.as_str(),
+                "same prompt, artist:sorted",
+            ],
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_time_folder_prefix_sorts_last() {
+        assert_eq!(
+            output_folder_name("image1", None, true),
+            "9999-12-31_235959_image1"
+        );
+        assert_eq!(output_folder_name("image1", None, false), "image1");
+    }
+
+    #[test]
     fn deduplicates_by_positive_prompt_when_enabled() {
         let root = test_root("deduplicates_by_positive_prompt_when_enabled");
         let input = root.join("input");
@@ -905,6 +1097,7 @@ mod tests {
             ExtractionOptions {
                 dedupe_positive_prompt: true,
                 dedupe_artist_tags: false,
+                sort_by_time: false,
             },
             &NoopProgressSink,
         )
@@ -948,6 +1141,7 @@ mod tests {
             ExtractionOptions {
                 dedupe_positive_prompt: false,
                 dedupe_artist_tags: true,
+                sort_by_time: false,
             },
             &NoopProgressSink,
         )
@@ -999,6 +1193,7 @@ mod tests {
             ExtractionOptions {
                 dedupe_positive_prompt: true,
                 dedupe_artist_tags: false,
+                sort_by_time: false,
             },
             &NoopProgressSink,
         )
@@ -1204,6 +1399,48 @@ mod tests {
 
     fn actual_output_path(summary: &RunSummary) -> PathBuf {
         PathBuf::from(&summary.output_path)
+    }
+
+    fn workbook_row(source_path: &str, sort_time: Option<SystemTime>) -> WorkbookRow {
+        WorkbookRow {
+            thumbnail_path: PathBuf::from(format!("{source_path}.thumb.png")),
+            source_path: source_path.to_string(),
+            sort_time,
+            sort_time_text: String::new(),
+            positive_prompt: String::new(),
+            negative_prompt: String::new(),
+            artist_tags: Vec::new(),
+            duplicate_folder: String::new(),
+        }
+    }
+
+    fn find_output_subdir(output_dir: &Path, base_name: &str) -> String {
+        fs::read_dir(output_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find_map(|entry| {
+                let file_type = entry.file_type().unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                (file_type.is_dir() && name.ends_with(&format!("_{base_name}"))).then_some(name)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} should contain a sorted {base_name} folder",
+                    output_dir.display()
+                )
+            })
+    }
+
+    fn assert_sorted_folder_name(folder_name: &str, base_name: &str) {
+        let suffix = format!("_{base_name}");
+        let prefix = folder_name
+            .strip_suffix(&suffix)
+            .unwrap_or_else(|| panic!("{folder_name} should end with {suffix}"));
+
+        assert_eq!(prefix.len(), "2026-05-26_120000".len());
+        assert_eq!(prefix.as_bytes()[4], b'-');
+        assert_eq!(prefix.as_bytes()[7], b'-');
+        assert_eq!(prefix.as_bytes()[10], b'_');
     }
 
     fn assert_xlsx_contains(output: &Path, expected_text: &[&str]) {
