@@ -1199,6 +1199,8 @@ mod tests {
                 "bad hands",
             ],
         );
+        assert_xlsx_cell_text(&actual_output, "F1", "图片路径");
+        assert_xlsx_cell_text(&actual_output, "F2", &png_path_text);
         assert!(!root.join("image1").exists());
         assert!(!actual_output.parent().unwrap().join("_Fail").exists());
 
@@ -1433,6 +1435,7 @@ mod tests {
                 "same prompt, artist:sorted",
             ],
         );
+        assert_xlsx_cell_text(&actual_output, "G1", "图片路径");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1844,6 +1847,53 @@ mod tests {
         for text in expected_text {
             assert!(shared_strings.contains(text));
         }
+    }
+
+    fn assert_xlsx_cell_text(output: &Path, cell: &str, expected_text: &str) {
+        let file = File::open(output).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+
+        let mut shared_strings = String::new();
+        archive
+            .by_name("xl/sharedStrings.xml")
+            .unwrap()
+            .read_to_string(&mut shared_strings)
+            .unwrap();
+
+        let expected_xml = escape_xml_text(expected_text);
+        let shared_string_index = shared_strings
+            .split("<si>")
+            .skip(1)
+            .position(|entry| entry.contains(&expected_xml))
+            .unwrap_or_else(|| panic!("missing shared string: {expected_text}"));
+
+        let mut sheet = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet)
+            .unwrap();
+
+        let cell_marker = format!(r#"<c r="{cell}" "#);
+        let cell_start = sheet
+            .find(&cell_marker)
+            .unwrap_or_else(|| panic!("missing cell: {cell}"));
+        let cell_xml = &sheet[cell_start..];
+        let cell_end = cell_xml
+            .find("</c>")
+            .unwrap_or_else(|| panic!("cell has no closing tag: {cell}"));
+        let cell_xml = &cell_xml[..cell_end + "</c>".len()];
+        assert!(
+            cell_xml.contains(&format!("<v>{shared_string_index}</v>")),
+            "{cell} did not contain expected text {expected_text}; cell xml: {cell_xml}"
+        );
+    }
+
+    fn escape_xml_text(value: &str) -> String {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     fn assert_xlsx_has_media(output: &Path) {

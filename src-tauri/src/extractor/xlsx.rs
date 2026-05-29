@@ -36,16 +36,15 @@ pub fn write_xlsx(
         let text_format = Format::new().set_text_wrap().set_align(FormatAlign::Top);
 
         worksheet.set_freeze_panes(1, 0)?;
-        let source_path_column = 1;
-        let time_column = 2;
+        let time_column = 1;
         let time_column_offset: u16 = if include_time_column { 1 } else { 0 };
-        let positive_prompt_column = 2 + time_column_offset;
-        let negative_prompt_column = 3 + time_column_offset;
-        let artist_tags_column = 4 + time_column_offset;
-        let duplicate_folder_column = 5 + time_column_offset;
+        let positive_prompt_column = 1 + time_column_offset;
+        let negative_prompt_column = 2 + time_column_offset;
+        let artist_tags_column = 3 + time_column_offset;
+        let duplicate_folder_column = 4 + time_column_offset;
+        let source_path_column = 5 + time_column_offset;
 
         worksheet.set_column_width_pixels(0, THUMBNAIL_CELL_PIXELS)?;
-        worksheet.set_column_width(source_path_column, 58)?;
         if include_time_column {
             worksheet.set_column_width(time_column, 20)?;
         }
@@ -53,10 +52,10 @@ pub fn write_xlsx(
         worksheet.set_column_width(negative_prompt_column, 48)?;
         worksheet.set_column_width(artist_tags_column, 34)?;
         worksheet.set_column_width(duplicate_folder_column, 18)?;
+        worksheet.set_column_width(source_path_column, 58)?;
         worksheet.set_row_height_pixels(0, 28)?;
 
         worksheet.write_string_with_format(0, 0, "图片", &header_format)?;
-        worksheet.write_string_with_format(0, source_path_column, "图片路径", &header_format)?;
         if include_time_column {
             worksheet.write_string_with_format(0, time_column, "时间", &header_format)?;
         }
@@ -79,6 +78,7 @@ pub fn write_xlsx(
             "重复文件夹",
             &header_format,
         )?;
+        worksheet.write_string_with_format(0, source_path_column, "图片路径", &header_format)?;
 
         for (index, row) in rows.iter().enumerate() {
             let row_number = (index + 1) as u32;
@@ -89,12 +89,6 @@ pub fn write_xlsx(
                 .set_alt_text(format!("图片：{}", row.source_path));
             worksheet.insert_image_fit_to_cell_centered(row_number, 0, &image)?;
 
-            worksheet.write_string_with_format(
-                row_number,
-                source_path_column,
-                truncate_for_excel(&row.source_path),
-                &text_format,
-            )?;
             if include_time_column {
                 worksheet.write_string_with_format(
                     row_number,
@@ -129,6 +123,12 @@ pub fn write_xlsx(
                     &text_format,
                 )?;
             }
+            worksheet.write_string_with_format(
+                row_number,
+                source_path_column,
+                truncate_for_excel(&row.source_path),
+                &text_format,
+            )?;
         }
     }
 
