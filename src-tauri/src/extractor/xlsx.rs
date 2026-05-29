@@ -36,15 +36,18 @@ pub fn write_xlsx(
         let text_format = Format::new().set_text_wrap().set_align(FormatAlign::Top);
 
         worksheet.set_freeze_panes(1, 0)?;
+        let source_path_column = 1;
+        let time_column = 2;
         let time_column_offset: u16 = if include_time_column { 1 } else { 0 };
-        let positive_prompt_column = 1 + time_column_offset;
-        let negative_prompt_column = 2 + time_column_offset;
-        let artist_tags_column = 3 + time_column_offset;
-        let duplicate_folder_column = 4 + time_column_offset;
+        let positive_prompt_column = 2 + time_column_offset;
+        let negative_prompt_column = 3 + time_column_offset;
+        let artist_tags_column = 4 + time_column_offset;
+        let duplicate_folder_column = 5 + time_column_offset;
 
         worksheet.set_column_width_pixels(0, THUMBNAIL_CELL_PIXELS)?;
+        worksheet.set_column_width(source_path_column, 58)?;
         if include_time_column {
-            worksheet.set_column_width(1, 20)?;
+            worksheet.set_column_width(time_column, 20)?;
         }
         worksheet.set_column_width(positive_prompt_column, 64)?;
         worksheet.set_column_width(negative_prompt_column, 48)?;
@@ -53,8 +56,9 @@ pub fn write_xlsx(
         worksheet.set_row_height_pixels(0, 28)?;
 
         worksheet.write_string_with_format(0, 0, "图片", &header_format)?;
+        worksheet.write_string_with_format(0, source_path_column, "图片路径", &header_format)?;
         if include_time_column {
-            worksheet.write_string_with_format(0, 1, "时间", &header_format)?;
+            worksheet.write_string_with_format(0, time_column, "时间", &header_format)?;
         }
         worksheet.write_string_with_format(
             0,
@@ -85,10 +89,16 @@ pub fn write_xlsx(
                 .set_alt_text(format!("图片：{}", row.source_path));
             worksheet.insert_image_fit_to_cell_centered(row_number, 0, &image)?;
 
+            worksheet.write_string_with_format(
+                row_number,
+                source_path_column,
+                truncate_for_excel(&row.source_path),
+                &text_format,
+            )?;
             if include_time_column {
                 worksheet.write_string_with_format(
                     row_number,
-                    1,
+                    time_column,
                     truncate_for_excel(&row.sort_time_text),
                     &text_format,
                 )?;

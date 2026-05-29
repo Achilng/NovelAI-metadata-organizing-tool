@@ -445,7 +445,11 @@ pub fn run_extraction_with_options(
                 );
                 rows.push(WorkbookRow {
                     thumbnail_path,
-                    source_path: source.display_path.clone(),
+                    source_path: source_path_for_xlsx(
+                        input_path,
+                        prepared_input.cache_match_mode,
+                        source,
+                    ),
                     sort_time: source.sort_time,
                     sort_time_text: format_time_for_xlsx(source.sort_time),
                     positive_prompt: image_state.metadata.positive_prompt.clone(),
@@ -814,6 +818,17 @@ fn sort_rows_by_time(rows: &mut [WorkbookRow]) {
     });
 }
 
+fn source_path_for_xlsx(
+    input_path: &Path,
+    cache_match_mode: CacheMatchMode,
+    source: &SourceImage,
+) -> String {
+    match cache_match_mode {
+        CacheMatchMode::FileSystem => source.absolute_path.display().to_string(),
+        CacheMatchMode::Archive => format!("{} > {}", input_path.display(), source.display_path),
+    }
+}
+
 fn compare_optional_time(left: Option<SystemTime>, right: Option<SystemTime>) -> CmpOrdering {
     match (left, right) {
         (Some(left), Some(right)) => left.partial_cmp(&right).unwrap_or(CmpOrdering::Equal),
@@ -1174,7 +1189,16 @@ mod tests {
         assert!(!output.exists());
         assert!(actual_output.exists());
         assert!(fs::metadata(&actual_output).unwrap().len() > 0);
-        assert_xlsx_contains(&actual_output, &["best quality, artist:demo", "bad hands"]);
+        let png_path_text = png_path.display().to_string();
+        assert_xlsx_contains(
+            &actual_output,
+            &[
+                "图片路径",
+                &png_path_text,
+                "best quality, artist:demo",
+                "bad hands",
+            ],
+        );
         assert!(!root.join("image1").exists());
         assert!(!actual_output.parent().unwrap().join("_Fail").exists());
 
@@ -1671,6 +1695,11 @@ mod tests {
         let actual_output = actual_output_path(&summary);
         assert!(!output.exists());
         assert!(actual_output.exists());
+        let archive_path_text = format!(r"{} &gt; nested\sample.png", archive_path.display());
+        assert_xlsx_contains(
+            &actual_output,
+            &["图片路径", &archive_path_text, "artist:zip"],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
