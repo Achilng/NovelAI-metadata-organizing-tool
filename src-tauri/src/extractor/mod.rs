@@ -1,4 +1,5 @@
 pub mod artist;
+pub mod cache;
 pub mod metadata;
 pub mod png_text;
 pub mod service;

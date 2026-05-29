@@ -30,6 +30,7 @@ async fn extract_to_xlsx(
     dedupe_positive_prompt: bool,
     dedupe_artist_tags: bool,
     sort_by_time: bool,
+    incremental: bool,
 ) -> Result<RunSummary, String> {
     let app_for_task = app.clone();
 
@@ -39,6 +40,7 @@ async fn extract_to_xlsx(
             dedupe_positive_prompt,
             dedupe_artist_tags,
             sort_by_time,
+            incremental,
         };
         run_extraction_with_options(
             Path::new(&input_path),

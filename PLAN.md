@@ -316,6 +316,17 @@ artist:sune (mugendai)
 - 在每次运行的临时目录下生成。
 - 工作簿写入后删除。
 
+## 10.1 增量整理和断点续传
+
+- 默认启用“增量整理”选项；用户可在界面中关闭。
+- 缓存目录位于用户选择的输出路径同级：`.novelai_metadata_cache`。
+- 缓存按输入路径建立独立空间；压缩包输入会把压缩包本身的大小和修改时间纳入缓存指纹。
+- 文件夹和单 PNG 输入按相对路径、文件大小和修改时间判断是否可复用。
+- 命中缓存时复用已解析的正向提示词、负向提示词、画师串、失败状态和持久缩略图，仍按当前选项重新执行去重、排序和 XLSX 生成。
+- 未命中缓存的图片才重新读取 PNG 文本元数据并生成缩略图。
+- 每处理完一张新增或变更图片后立即写入单独缓存记录，因此中途失败、关闭或崩溃后，下次运行可从已缓存记录继续。
+- 缓存不会改变原始输入文件；正式导出仍然每次创建新的输出包文件夹，避免覆盖旧结果。
+
 ## 11. 后端命令设计
 
 主 Tauri 命令：
@@ -328,6 +339,7 @@ async fn extract_to_xlsx(
     dedupe_positive_prompt: bool,
     dedupe_artist_tags: bool,
     sort_by_time: bool,
+    incremental: bool,
 ) -> Result<RunSummary, String>
 ```
 
@@ -350,6 +362,8 @@ struct RunSummary {
     processed: usize,
     failed: usize,
     skipped_duplicates: usize,
+    cache_hits: usize,
+    processed_new: usize,
     output_path: String,
     warnings: Vec<FileWarning>,
 }

@@ -4,6 +4,6 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 *.tmp
+.novelai_metadata_cache/
 .DS_Store
 Thumbs.db
-

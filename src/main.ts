@@ -8,6 +8,8 @@ type RunSummary = {
   processed: number;
   failed: number;
   skipped_duplicates: number;
+  cache_hits: number;
+  processed_new: number;
   output_path: string;
   warnings: FileWarning[];
 };
@@ -22,6 +24,8 @@ type ProgressPayload = {
   processed?: number;
   failed?: number;
   skipped_duplicates?: number;
+  cache_hits?: number;
+  processed_new?: number;
   current_file?: string;
   message?: string;
 };
@@ -33,9 +37,12 @@ const state = {
   dedupePositivePrompt: false,
   dedupeArtistTags: false,
   sortByTime: false,
+  incremental: true,
   processed: 0,
   failed: 0,
   skippedDuplicates: 0,
+  cacheHits: 0,
+  processedNew: 0,
   total: 0,
   currentFile: "",
   status: "请选择输入和输出路径。",
@@ -84,6 +91,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <input id="sort-by-time" type="checkbox" />
           <span>按时间升序整理</span>
         </label>
+        <label class="toggle-option">
+          <input id="incremental" type="checkbox" />
+          <span>增量整理</span>
+        </label>
       </div>
     </section>
 
@@ -102,6 +113,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <span>已处理 <strong id="processed">0</strong></span>
         <span>失败 <strong id="failed">0</strong></span>
         <span>去重跳过 <strong id="skipped-duplicates">0</strong></span>
+        <span>缓存复用 <strong id="cache-hits">0</strong></span>
+        <span>新处理 <strong id="processed-new">0</strong></span>
       </div>
       <div class="current-file">
         <span>当前文件</span>
@@ -127,6 +140,7 @@ const dedupePositivePromptCheckbox = document.querySelector<HTMLInputElement>(
 )!;
 const dedupeArtistTagsCheckbox = document.querySelector<HTMLInputElement>("#dedupe-artist-tags")!;
 const sortByTimeCheckbox = document.querySelector<HTMLInputElement>("#sort-by-time")!;
+const incrementalCheckbox = document.querySelector<HTMLInputElement>("#incremental")!;
 const inputPathOutput = document.querySelector<HTMLOutputElement>("#input-path")!;
 const outputPathOutput = document.querySelector<HTMLOutputElement>("#output-path")!;
 const statusMessage = document.querySelector<HTMLParagraphElement>("#status-message")!;
@@ -135,6 +149,8 @@ const total = document.querySelector<HTMLElement>("#total")!;
 const processed = document.querySelector<HTMLElement>("#processed")!;
 const failed = document.querySelector<HTMLElement>("#failed")!;
 const skippedDuplicates = document.querySelector<HTMLElement>("#skipped-duplicates")!;
+const cacheHits = document.querySelector<HTMLElement>("#cache-hits")!;
+const processedNew = document.querySelector<HTMLElement>("#processed-new")!;
 const currentFile = document.querySelector<HTMLOutputElement>("#current-file")!;
 const warnings = document.querySelector<HTMLUListElement>("#warnings")!;
 
@@ -146,6 +162,8 @@ function render() {
   processed.textContent = String(state.processed);
   failed.textContent = String(state.failed);
   skippedDuplicates.textContent = String(state.skippedDuplicates);
+  cacheHits.textContent = String(state.cacheHits);
+  processedNew.textContent = String(state.processedNew);
   currentFile.textContent = state.currentFile || "-";
 
   const percent = state.total === 0 ? 0 : Math.round((state.processed / state.total) * 100);
@@ -162,6 +180,8 @@ function render() {
   dedupeArtistTagsCheckbox.disabled = state.isRunning;
   sortByTimeCheckbox.checked = state.sortByTime;
   sortByTimeCheckbox.disabled = state.isRunning;
+  incrementalCheckbox.checked = state.incremental;
+  incrementalCheckbox.disabled = state.isRunning;
 
   warnings.innerHTML = "";
   if (state.warnings.length === 0) {
@@ -233,6 +253,11 @@ sortByTimeCheckbox.addEventListener("change", () => {
   render();
 });
 
+incrementalCheckbox.addEventListener("change", () => {
+  state.incremental = incrementalCheckbox.checked;
+  render();
+});
+
 startButton.addEventListener("click", async () => {
   if (!state.inputPath || !state.outputPath || state.isRunning) {
     return;
@@ -243,6 +268,8 @@ startButton.addEventListener("click", async () => {
   state.processed = 0;
   state.failed = 0;
   state.skippedDuplicates = 0;
+  state.cacheHits = 0;
+  state.processedNew = 0;
   state.currentFile = "";
   state.warnings = [];
   state.status = "正在处理...";
@@ -254,17 +281,17 @@ startButton.addEventListener("click", async () => {
       outputPath: state.outputPath,
       dedupePositivePrompt: state.dedupePositivePrompt,
       dedupeArtistTags: state.dedupeArtistTags,
-      sortByTime: state.sortByTime
+      sortByTime: state.sortByTime,
+      incremental: state.incremental
     });
     state.total = summary.total_png;
     state.processed = summary.processed;
     state.failed = summary.failed;
     state.skippedDuplicates = summary.skipped_duplicates;
+    state.cacheHits = summary.cache_hits;
+    state.processedNew = summary.processed_new;
     state.warnings = summary.warnings;
-    state.status =
-      summary.skipped_duplicates > 0
-        ? `完成：已生成 ${summary.output_path}，去重跳过 ${summary.skipped_duplicates} 张`
-        : `完成：已生成 ${summary.output_path}`;
+    state.status = `完成：已生成 ${summary.output_path}，缓存复用 ${summary.cache_hits} 张，新处理 ${summary.processed_new} 张，去重跳过 ${summary.skipped_duplicates} 张`;
   } catch (error) {
     state.status = error instanceof Error ? error.message : String(error);
   } finally {
@@ -279,6 +306,8 @@ await listen<ProgressPayload>("extract:start", (event) => {
   state.processed = 0;
   state.failed = 0;
   state.skippedDuplicates = 0;
+  state.cacheHits = 0;
+  state.processedNew = 0;
   state.status = event.payload.message ?? "开始处理...";
   render();
 });
@@ -286,6 +315,8 @@ await listen<ProgressPayload>("extract:start", (event) => {
 await listen<ProgressPayload>("extract:scan_complete", (event) => {
   state.total = event.payload.total_png ?? state.total;
   state.skippedDuplicates = event.payload.skipped_duplicates ?? state.skippedDuplicates;
+  state.cacheHits = event.payload.cache_hits ?? state.cacheHits;
+  state.processedNew = event.payload.processed_new ?? state.processedNew;
   state.status = event.payload.message ?? "扫描完成。";
   render();
 });
@@ -294,6 +325,8 @@ await listen<ProgressPayload>("extract:file_progress", (event) => {
   state.processed = event.payload.processed ?? state.processed;
   state.failed = event.payload.failed ?? state.failed;
   state.skippedDuplicates = event.payload.skipped_duplicates ?? state.skippedDuplicates;
+  state.cacheHits = event.payload.cache_hits ?? state.cacheHits;
+  state.processedNew = event.payload.processed_new ?? state.processedNew;
   state.currentFile = event.payload.current_file ?? "";
   state.status = event.payload.message ?? "正在处理...";
   render();

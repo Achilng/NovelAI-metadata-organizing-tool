@@ -1,4 +1,5 @@
-use super::metadata::parse_novelai_metadata;
+use super::cache::{CacheStore, CachedImageRecord, FileFingerprint};
+use super::metadata::{parse_novelai_metadata, NovelAiMetadata};
 use super::png_text::read_png_text_chunks;
 use super::xlsx::{write_xlsx, WorkbookRow};
 use anyhow::{bail, Context, Result};
@@ -42,6 +43,8 @@ pub struct RunSummary {
     pub processed: usize,
     pub failed: usize,
     pub skipped_duplicates: usize,
+    pub cache_hits: usize,
+    pub processed_new: usize,
     pub output_path: String,
     pub warnings: Vec<FileWarning>,
 }
@@ -52,6 +55,8 @@ pub struct ProgressPayload {
     pub processed: Option<usize>,
     pub failed: Option<usize>,
     pub skipped_duplicates: Option<usize>,
+    pub cache_hits: Option<usize>,
+    pub processed_new: Option<usize>,
     pub current_file: Option<String>,
     pub message: Option<String>,
 }
@@ -71,6 +76,7 @@ impl ProgressSink for NoopProgressSink {}
 struct SourceImage {
     absolute_path: PathBuf,
     display_path: String,
+    fingerprint: FileFingerprint,
     sort_time: Option<SystemTime>,
 }
 
@@ -79,6 +85,19 @@ pub struct ExtractionOptions {
     pub dedupe_positive_prompt: bool,
     pub dedupe_artist_tags: bool,
     pub sort_by_time: bool,
+    pub incremental: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMatchMode {
+    FileSystem,
+    Archive,
+}
+
+struct PreparedInput {
+    path: PathBuf,
+    cache_match_mode: CacheMatchMode,
+    archive_fingerprint: Option<FileFingerprint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -274,15 +293,27 @@ pub fn run_extraction_with_options(
             processed: Some(0),
             failed: Some(0),
             skipped_duplicates: Some(0),
+            cache_hits: Some(0),
+            processed_new: Some(0),
             current_file: None,
             message: Some("正在扫描输入路径...".to_string()),
         },
     );
 
     let temp_dir = RunTempDir::create()?;
-    let prepared_input_path = prepare_input(input_path, &temp_dir.path)?;
-    let images = collect_png_files(&prepared_input_path)?;
+    let prepared_input = prepare_input(input_path, &temp_dir.path)?;
+    let images = collect_png_files(&prepared_input.path)?;
     let total_png = images.len();
+    let mut cache = if options.incremental {
+        Some(CacheStore::open(
+            &output_directory(output_path),
+            input_path,
+            prepared_input.archive_fingerprint,
+        )?)
+    } else {
+        None
+    };
+    let existing_cache_records = cache.as_ref().map(CacheStore::record_count).unwrap_or(0);
     let output_path = prepare_output_package(output_path)?;
 
     progress.emit_progress(
@@ -292,8 +323,17 @@ pub fn run_extraction_with_options(
             processed: Some(0),
             failed: Some(0),
             skipped_duplicates: Some(0),
+            cache_hits: Some(0),
+            processed_new: Some(0),
             current_file: None,
-            message: Some(format!("扫描完成，共找到 {} 个 PNG 文件。", total_png)),
+            message: Some(if options.incremental {
+                format!(
+                    "扫描完成，共找到 {} 个 PNG 文件，已加载 {} 条缓存记录。",
+                    total_png, existing_cache_records
+                )
+            } else {
+                format!("扫描完成，共找到 {} 个 PNG 文件。", total_png)
+            }),
         },
     );
 
@@ -301,6 +341,8 @@ pub fn run_extraction_with_options(
     let mut warnings = Vec::new();
     let mut failed = 0_usize;
     let mut skipped_duplicates = 0_usize;
+    let mut cache_hits = 0_usize;
+    let mut processed_new = 0_usize;
     let mut positive_prompt_groups = HashMap::new();
     let mut artist_string_groups = HashMap::new();
     let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
@@ -308,33 +350,30 @@ pub fn run_extraction_with_options(
     let mut failure_folder_writer = FailureFolderWriter::new(&output_path);
 
     for (index, source) in images.iter().enumerate() {
-        let mut file_failed = false;
-        let mut metadata_warning = None;
+        let mut image_state =
+            cached_image_state(source, cache.as_ref(), prepared_input.cache_match_mode);
+        let mut cache_record_dirty = false;
 
-        let metadata = match read_png_text_chunks(&source.absolute_path) {
-            Ok(text_chunks) => {
-                if text_chunks.is_empty() {
-                    metadata_warning = Some("未找到 PNG 文本元数据。".to_string());
-                    file_failed = true;
-                }
-                parse_novelai_metadata(&text_chunks)
-            }
-            Err(error) => {
-                metadata_warning = Some(format!("无法读取 PNG 文本元数据：{error}"));
-                file_failed = true;
-                parse_novelai_metadata(&Default::default())
-            }
-        };
+        if image_state.is_some() {
+            cache_hits += 1;
+        } else {
+            image_state = Some(read_image_metadata(source));
+            cache_record_dirty = cache.is_some();
+            processed_new += 1;
+        }
 
-        if let Some(message) = metadata_warning {
+        let mut image_state = image_state.expect("image state should be loaded or cached");
+        let mut file_failed = image_state.metadata_failed;
+
+        if let Some(message) = image_state.metadata_warning.clone() {
             let warning = FileWarning::new(source.display_path.clone(), message);
             progress.emit_warning(&warning);
             warnings.push(warning);
         }
 
         if let Some(duplicate) = duplicate_match(
-            &metadata.positive_prompt,
-            &metadata.artist_tags,
+            &image_state.metadata.positive_prompt,
+            &image_state.metadata.artist_tags,
             options,
             &positive_prompt_groups,
             &artist_string_groups,
@@ -350,6 +389,12 @@ pub fn run_extraction_with_options(
                 failed += 1;
             }
 
+            if cache_record_dirty {
+                if let Some(cache_store) = cache.as_mut() {
+                    cache_store.save_record(cache_record_from_state(source, &image_state))?;
+                }
+            }
+
             progress.emit_progress(
                 "extract:file_progress",
                 ProgressPayload {
@@ -357,11 +402,15 @@ pub fn run_extraction_with_options(
                     processed: Some(index + 1),
                     failed: Some(failed),
                     skipped_duplicates: Some(skipped_duplicates),
+                    cache_hits: Some(cache_hits),
+                    processed_new: Some(processed_new),
                     current_file: Some(source.display_path.clone()),
                     message: Some(format!(
-                        "正在处理 {} / {}，已去重跳过 {} 张（{}）",
+                        "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张，已去重跳过 {} 张（{}）",
                         index + 1,
                         total_png,
+                        cache_hits,
+                        processed_new,
                         skipped_duplicates,
                         duplicate.reason
                     )),
@@ -370,14 +419,25 @@ pub fn run_extraction_with_options(
             continue;
         }
 
-        match create_thumbnail(&source.absolute_path, &temp_dir.path, index) {
+        let thumbnail_result = thumbnail_for_row(
+            source,
+            &mut image_state,
+            cache.as_ref(),
+            &temp_dir.path,
+            index,
+        );
+        if thumbnail_result.1 {
+            cache_record_dirty = true;
+        }
+
+        match thumbnail_result.0 {
             Ok(thumbnail_path) => {
                 let row_index = rows.len();
                 remember_dedup_group(
                     source,
                     row_index,
-                    &metadata.positive_prompt,
-                    &metadata.artist_tags,
+                    &image_state.metadata.positive_prompt,
+                    &image_state.metadata.artist_tags,
                     options,
                     &mut duplicate_groups,
                     &mut positive_prompt_groups,
@@ -388,9 +448,9 @@ pub fn run_extraction_with_options(
                     source_path: source.display_path.clone(),
                     sort_time: source.sort_time,
                     sort_time_text: format_time_for_xlsx(source.sort_time),
-                    positive_prompt: metadata.positive_prompt,
-                    negative_prompt: metadata.negative_prompt,
-                    artist_tags: metadata.artist_tags,
+                    positive_prompt: image_state.metadata.positive_prompt.clone(),
+                    negative_prompt: image_state.metadata.negative_prompt.clone(),
+                    artist_tags: image_state.metadata.artist_tags.clone(),
                     duplicate_folder: String::new(),
                 });
             }
@@ -402,6 +462,12 @@ pub fn run_extraction_with_options(
                 );
                 progress.emit_warning(&warning);
                 warnings.push(warning);
+            }
+        }
+
+        if cache_record_dirty {
+            if let Some(cache_store) = cache.as_mut() {
+                cache_store.save_record(cache_record_from_state(source, &image_state))?;
             }
         }
 
@@ -417,8 +483,16 @@ pub fn run_extraction_with_options(
                 processed: Some(index + 1),
                 failed: Some(failed),
                 skipped_duplicates: Some(skipped_duplicates),
+                cache_hits: Some(cache_hits),
+                processed_new: Some(processed_new),
                 current_file: Some(source.display_path.clone()),
-                message: Some(format!("正在处理 {} / {}", index + 1, total_png)),
+                message: Some(format!(
+                    "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张",
+                    index + 1,
+                    total_png,
+                    cache_hits,
+                    processed_new
+                )),
             },
         );
     }
@@ -443,6 +517,8 @@ pub fn run_extraction_with_options(
             processed: Some(total_png),
             failed: Some(failed),
             skipped_duplicates: Some(skipped_duplicates),
+            cache_hits: Some(cache_hits),
+            processed_new: Some(processed_new),
             current_file: None,
             message: Some("处理完成。".to_string()),
         },
@@ -453,9 +529,146 @@ pub fn run_extraction_with_options(
         processed: total_png,
         failed,
         skipped_duplicates,
+        cache_hits,
+        processed_new,
         output_path: output_path.display().to_string(),
         warnings,
     })
+}
+
+struct ImageProcessingState {
+    metadata: NovelAiMetadata,
+    metadata_warning: Option<String>,
+    metadata_failed: bool,
+    thumbnail_file_name: Option<String>,
+    thumbnail_error: Option<String>,
+}
+
+fn cached_image_state(
+    source: &SourceImage,
+    cache: Option<&CacheStore>,
+    cache_match_mode: CacheMatchMode,
+) -> Option<ImageProcessingState> {
+    let record = cache?.get(&source.display_path)?;
+    if !cache_record_matches_source(record, source, cache_match_mode) {
+        return None;
+    }
+
+    Some(ImageProcessingState {
+        metadata: NovelAiMetadata {
+            positive_prompt: record.positive_prompt.clone(),
+            negative_prompt: record.negative_prompt.clone(),
+            artist_tags: record.artist_tags.clone(),
+        },
+        metadata_warning: record.metadata_warning.clone(),
+        metadata_failed: record.metadata_failed,
+        thumbnail_file_name: record.thumbnail_file_name.clone(),
+        thumbnail_error: record.thumbnail_error.clone(),
+    })
+}
+
+fn cache_record_matches_source(
+    record: &CachedImageRecord,
+    source: &SourceImage,
+    cache_match_mode: CacheMatchMode,
+) -> bool {
+    if record.source_size != source.fingerprint.size {
+        return false;
+    }
+
+    match cache_match_mode {
+        CacheMatchMode::FileSystem => {
+            record.source_modified_nanos == source.fingerprint.modified_nanos
+        }
+        CacheMatchMode::Archive => true,
+    }
+}
+
+fn read_image_metadata(source: &SourceImage) -> ImageProcessingState {
+    let mut metadata_warning = None;
+    let mut metadata_failed = false;
+
+    let metadata = match read_png_text_chunks(&source.absolute_path) {
+        Ok(text_chunks) => {
+            if text_chunks.is_empty() {
+                metadata_warning = Some("未找到 PNG 文本元数据。".to_string());
+                metadata_failed = true;
+            }
+            parse_novelai_metadata(&text_chunks)
+        }
+        Err(error) => {
+            metadata_warning = Some(format!("无法读取 PNG 文本元数据：{error}"));
+            metadata_failed = true;
+            parse_novelai_metadata(&Default::default())
+        }
+    };
+
+    ImageProcessingState {
+        metadata,
+        metadata_warning,
+        metadata_failed,
+        thumbnail_file_name: None,
+        thumbnail_error: None,
+    }
+}
+
+fn thumbnail_for_row(
+    source: &SourceImage,
+    image_state: &mut ImageProcessingState,
+    cache: Option<&CacheStore>,
+    temp_dir: &Path,
+    index: usize,
+) -> (Result<PathBuf>, bool) {
+    let Some(cache_store) = cache else {
+        return (
+            create_thumbnail(&source.absolute_path, temp_dir, index),
+            false,
+        );
+    };
+
+    if let Some(file_name) = image_state.thumbnail_file_name.clone() {
+        let thumbnail_path = cache_store.thumbnail_path_for_file_name(&file_name);
+        if thumbnail_path.exists() {
+            return (Ok(thumbnail_path), false);
+        }
+    } else if let Some(error) = image_state.thumbnail_error.clone() {
+        return (Err(anyhow::anyhow!(error)), false);
+    }
+
+    let thumbnail_file_name = cache_store.thumbnail_file_name(&source.display_path);
+    let thumbnail_path = cache_store.thumbnail_path_for_display_path(&source.display_path);
+    let thumbnail_result = create_thumbnail_at(&source.absolute_path, &thumbnail_path);
+
+    match thumbnail_result {
+        Ok(()) => {
+            image_state.thumbnail_file_name = Some(thumbnail_file_name);
+            image_state.thumbnail_error = None;
+            (Ok(thumbnail_path), true)
+        }
+        Err(error) => {
+            image_state.thumbnail_file_name = None;
+            image_state.thumbnail_error = Some(error.to_string());
+            (Err(error), true)
+        }
+    }
+}
+
+fn cache_record_from_state(
+    source: &SourceImage,
+    image_state: &ImageProcessingState,
+) -> CachedImageRecord {
+    CachedImageRecord {
+        display_path: source.display_path.clone(),
+        source_size: source.fingerprint.size,
+        source_modified_nanos: source.fingerprint.modified_nanos,
+        positive_prompt: image_state.metadata.positive_prompt.clone(),
+        negative_prompt: image_state.metadata.negative_prompt.clone(),
+        artist_tags: image_state.metadata.artist_tags.clone(),
+        metadata_warning: image_state.metadata_warning.clone(),
+        metadata_failed: image_state.metadata_failed,
+        thumbnail_file_name: image_state.thumbnail_file_name.clone(),
+        thumbnail_error: image_state.thumbnail_error.clone(),
+    }
 }
 
 fn duplicate_match(
@@ -751,7 +964,7 @@ fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| input_path.display().to_string());
-            return Ok(vec![source_image(input_path, display_path)]);
+            return Ok(vec![source_image(input_path, display_path)?]);
         }
 
         if is_supported_archive(input_path) {
@@ -779,19 +992,20 @@ fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
             .display()
             .to_string();
 
-        images.push(source_image(entry.path(), display_path));
+        images.push(source_image(entry.path(), display_path)?);
     }
 
     images.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     Ok(images)
 }
 
-fn source_image(path: &Path, display_path: String) -> SourceImage {
-    SourceImage {
+fn source_image(path: &Path, display_path: String) -> Result<SourceImage> {
+    Ok(SourceImage {
         absolute_path: path.to_path_buf(),
         display_path,
+        fingerprint: FileFingerprint::from_path(path)?,
         sort_time: file_creation_time(path),
-    }
+    })
 }
 
 fn file_creation_time(path: &Path) -> Option<SystemTime> {
@@ -818,11 +1032,16 @@ fn archive_extension(path: &Path) -> Option<String> {
     }
 }
 
-fn prepare_input(input_path: &Path, temp_dir: &Path) -> Result<PathBuf> {
+fn prepare_input(input_path: &Path, temp_dir: &Path) -> Result<PreparedInput> {
     let Some(extension) = archive_extension(input_path) else {
-        return Ok(input_path.to_path_buf());
+        return Ok(PreparedInput {
+            path: input_path.to_path_buf(),
+            cache_match_mode: CacheMatchMode::FileSystem,
+            archive_fingerprint: None,
+        });
     };
 
+    let archive_fingerprint = FileFingerprint::from_path(input_path)?;
     let extract_dir = temp_dir.join("archive");
     fs::create_dir_all(&extract_dir)
         .with_context(|| format!("无法创建解压目录：{}", extract_dir.display()))?;
@@ -834,7 +1053,11 @@ fn prepare_input(input_path: &Path, temp_dir: &Path) -> Result<PathBuf> {
         _ => unreachable!(),
     }
 
-    Ok(extract_dir)
+    Ok(PreparedInput {
+        path: extract_dir,
+        cache_match_mode: CacheMatchMode::Archive,
+        archive_fingerprint: Some(archive_fingerprint),
+    })
 }
 
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<()> {
@@ -889,15 +1112,26 @@ fn create_thumbnail(source_path: &Path, temp_dir: &Path, index: usize) -> Result
     fs::create_dir_all(&thumbnails_dir)
         .with_context(|| format!("无法创建缩略图临时目录：{}", thumbnails_dir.display()))?;
 
+    let thumbnail_path = thumbnails_dir.join(format!("{index:06}.png"));
+    create_thumbnail_at(source_path, &thumbnail_path)?;
+
+    Ok(thumbnail_path)
+}
+
+fn create_thumbnail_at(source_path: &Path, thumbnail_path: &Path) -> Result<()> {
+    if let Some(parent) = thumbnail_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建缩略图目录：{}", parent.display()))?;
+    }
+
     let image = image::open(source_path)
         .with_context(|| format!("无法读取图片：{}", source_path.display()))?;
     let thumbnail = image.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
-    let thumbnail_path = thumbnails_dir.join(format!("{index:06}.png"));
     thumbnail
-        .save_with_format(&thumbnail_path, image::ImageFormat::Png)
+        .save_with_format(thumbnail_path, image::ImageFormat::Png)
         .with_context(|| format!("无法保存缩略图：{}", thumbnail_path.display()))?;
 
-    Ok(thumbnail_path)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -971,6 +1205,117 @@ mod tests {
     }
 
     #[test]
+    fn incremental_reuses_unchanged_folder_records() {
+        let root = test_root("incremental_reuses_unchanged_folder_records");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:cached");
+
+        let output = root.join("metadata.xlsx");
+        let options = ExtractionOptions {
+            incremental: true,
+            ..ExtractionOptions::default()
+        };
+        let first_summary =
+            run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+        assert_eq!(first_summary.total_png, 1);
+        assert_eq!(first_summary.cache_hits, 0);
+        assert_eq!(first_summary.processed_new, 1);
+        assert!(root.join(".novelai_metadata_cache").is_dir());
+
+        let second_summary =
+            run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+        assert_eq!(second_summary.total_png, 1);
+        assert_eq!(second_summary.cache_hits, 1);
+        assert_eq!(second_summary.processed_new, 0);
+        let actual_output = actual_output_path(&second_summary);
+        assert_eq!(actual_output, root.join("metadata_1").join("metadata.xlsx"));
+        assert_xlsx_contains(&actual_output, &["artist:cached"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_processes_only_new_folder_files() {
+        let root = test_root("incremental_processes_only_new_folder_files");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "artist:first");
+
+        let output = root.join("metadata.xlsx");
+        let options = ExtractionOptions {
+            incremental: true,
+            ..ExtractionOptions::default()
+        };
+        run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "artist:second");
+
+        let second_summary =
+            run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+        assert_eq!(second_summary.total_png, 2);
+        assert_eq!(second_summary.cache_hits, 1);
+        assert_eq!(second_summary.processed_new, 1);
+        assert_xlsx_contains(
+            &actual_output_path(&second_summary),
+            &["artist:first", "artist:second"],
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_reuses_metadata_when_dedupe_option_changes() {
+        let root = test_root("incremental_reuses_metadata_when_dedupe_option_changes");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "same prompt, artist:cache");
+
+        let second_png = input.join("second.png");
+        create_colored_test_png(&second_png, [71, 128, 48]);
+        insert_text_chunk(&second_png, "Description", "same prompt, artist:cache");
+
+        let output = root.join("metadata.xlsx");
+        let dedupe_options = ExtractionOptions {
+            dedupe_positive_prompt: true,
+            incremental: true,
+            ..ExtractionOptions::default()
+        };
+        let first_summary =
+            run_extraction_with_options(&input, &output, dedupe_options, &NoopProgressSink)
+                .unwrap();
+        assert_eq!(first_summary.skipped_duplicates, 1);
+        assert_eq!(first_summary.cache_hits, 0);
+        assert_eq!(first_summary.processed_new, 2);
+        assert_xlsx_media_count(&actual_output_path(&first_summary), 1);
+
+        let no_dedupe_options = ExtractionOptions {
+            incremental: true,
+            ..ExtractionOptions::default()
+        };
+        let second_summary =
+            run_extraction_with_options(&input, &output, no_dedupe_options, &NoopProgressSink)
+                .unwrap();
+        assert_eq!(second_summary.skipped_duplicates, 0);
+        assert_eq!(second_summary.cache_hits, 2);
+        assert_eq!(second_summary.processed_new, 0);
+        assert_xlsx_media_count(&actual_output_path(&second_summary), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scans_nested_png_folder() {
         let root = test_root("scans_nested_png_folder");
         let input = root.join("input").join("nested");
@@ -1038,6 +1383,7 @@ mod tests {
                 dedupe_positive_prompt: true,
                 dedupe_artist_tags: false,
                 sort_by_time: true,
+                incremental: false,
             },
             &NoopProgressSink,
         )
@@ -1098,6 +1444,7 @@ mod tests {
                 dedupe_positive_prompt: true,
                 dedupe_artist_tags: false,
                 sort_by_time: false,
+                incremental: false,
             },
             &NoopProgressSink,
         )
@@ -1142,6 +1489,7 @@ mod tests {
                 dedupe_positive_prompt: false,
                 dedupe_artist_tags: true,
                 sort_by_time: false,
+                incremental: false,
             },
             &NoopProgressSink,
         )
@@ -1194,6 +1542,7 @@ mod tests {
                 dedupe_positive_prompt: true,
                 dedupe_artist_tags: false,
                 sort_by_time: false,
+                incremental: false,
             },
             &NoopProgressSink,
         )
@@ -1384,7 +1733,11 @@ mod tests {
     }
 
     fn create_test_png(path: &Path) {
-        let image = RgbImage::from_pixel(4, 4, Rgb([40, 94, 172]));
+        create_colored_test_png(path, [40, 94, 172]);
+    }
+
+    fn create_colored_test_png(path: &Path, color: [u8; 3]) {
+        let image = RgbImage::from_pixel(4, 4, Rgb(color));
         image.save(path).unwrap();
     }
 
