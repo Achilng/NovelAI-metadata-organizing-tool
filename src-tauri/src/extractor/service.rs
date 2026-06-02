@@ -6,12 +6,13 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local};
 use serde::Serialize;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use unrar_ng::Archive;
 use walkdir::WalkDir;
@@ -20,6 +21,7 @@ use zip::ZipArchive;
 const THUMBNAIL_SIZE: u32 = 160;
 const TEMP_ROOT: &str = r"D:\Agent\Agent_temp";
 const MISSING_TIME_FOLDER_PREFIX: &str = "9999-12-31_235959";
+const MAX_IMAGE_WORKER_THREADS: usize = 8;
 static RUN_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +306,8 @@ pub fn run_extraction_with_options(
     let prepared_input = prepare_input(input_path, &temp_dir.path)?;
     let images = collect_png_files(&prepared_input.path)?;
     let total_png = images.len();
+    let worker_count = image_worker_count(total_png);
+    let worker_count_description = worker_count_description(worker_count);
     let mut cache = if options.incremental {
         Some(CacheStore::open(
             &output_directory(output_path),
@@ -328,11 +332,14 @@ pub fn run_extraction_with_options(
             current_file: None,
             message: Some(if options.incremental {
                 format!(
-                    "扫描完成，共找到 {} 个 PNG 文件，已加载 {} 条缓存记录。",
-                    total_png, existing_cache_records
+                    "扫描完成，共找到 {} 个 PNG 文件，已加载 {} 条缓存记录，{}。",
+                    total_png, existing_cache_records, worker_count_description
                 )
             } else {
-                format!("扫描完成，共找到 {} 个 PNG 文件。", total_png)
+                format!(
+                    "扫描完成，共找到 {} 个 PNG 文件，{}。",
+                    total_png, worker_count_description
+                )
             }),
         },
     );
@@ -349,50 +356,160 @@ pub fn run_extraction_with_options(
     let mut duplicate_folder_writer = DuplicateFolderWriter::new(&output_path);
     let mut failure_folder_writer = FailureFolderWriter::new(&output_path);
 
-    for (index, source) in images.iter().enumerate() {
-        let mut image_state =
-            cached_image_state(source, cache.as_ref(), prepared_input.cache_match_mode);
-        let mut cache_record_dirty = false;
-
-        if image_state.is_some() {
-            cache_hits += 1;
-        } else {
-            image_state = Some(read_image_metadata(source));
-            cache_record_dirty = cache.is_some();
-            processed_new += 1;
+    if dedupe_enabled(options) {
+        if total_png > 0 {
+            progress.emit_progress(
+                "extract:file_progress",
+                ProgressPayload {
+                    total_png: Some(total_png),
+                    processed: Some(0),
+                    failed: Some(0),
+                    skipped_duplicates: Some(0),
+                    cache_hits: Some(0),
+                    processed_new: Some(0),
+                    current_file: None,
+                    message: Some(format!("正在使用 {worker_count} 个线程读取 PNG 元数据...")),
+                },
+            );
         }
 
-        let mut image_state = image_state.expect("image state should be loaded or cached");
-        let mut file_failed = image_state.metadata_failed;
+        let loaded_images = load_image_states_parallel(
+            &images,
+            cache.as_ref(),
+            prepared_input.cache_match_mode,
+            worker_count,
+        );
 
-        if let Some(message) = image_state.metadata_warning.clone() {
-            let warning = FileWarning::new(source.display_path.clone(), message);
-            progress.emit_warning(&warning);
-            warnings.push(warning);
-        }
+        for (index, loaded_image) in loaded_images.into_iter().enumerate() {
+            let LoadedImage {
+                source,
+                mut image_state,
+                cache_hit,
+                mut cache_record_dirty,
+            } = loaded_image;
 
-        if let Some(duplicate) = duplicate_match(
-            &image_state.metadata.positive_prompt,
-            &image_state.metadata.artist_tags,
-            options,
-            &positive_prompt_groups,
-            &artist_string_groups,
-        ) {
-            skipped_duplicates += 1;
+            if cache_hit {
+                cache_hits += 1;
+            } else {
+                processed_new += 1;
+            }
 
-            let group = &mut duplicate_groups[duplicate.group_index];
-            group.sort_time = earliest_sort_time(group.sort_time, source.sort_time);
-            group.duplicate_sources.push(source.clone());
+            let mut file_failed = image_state.metadata_failed;
 
-            if file_failed {
-                failure_folder_writer.remember_failed_source(source);
-                failed += 1;
+            if let Some(message) = image_state.metadata_warning.clone() {
+                let warning = FileWarning::new(source.display_path.clone(), message);
+                progress.emit_warning(&warning);
+                warnings.push(warning);
+            }
+
+            if let Some(duplicate) = duplicate_match(
+                &image_state.metadata.positive_prompt,
+                &image_state.metadata.artist_tags,
+                options,
+                &positive_prompt_groups,
+                &artist_string_groups,
+            ) {
+                skipped_duplicates += 1;
+
+                let group = &mut duplicate_groups[duplicate.group_index];
+                group.sort_time = earliest_sort_time(group.sort_time, source.sort_time);
+                group.duplicate_sources.push(source.clone());
+
+                if file_failed {
+                    failure_folder_writer.remember_failed_source(&source);
+                    failed += 1;
+                }
+
+                if cache_record_dirty {
+                    if let Some(cache_store) = cache.as_mut() {
+                        cache_store.save_record(cache_record_from_state(&source, &image_state))?;
+                    }
+                }
+
+                progress.emit_progress(
+                    "extract:file_progress",
+                    ProgressPayload {
+                        total_png: Some(total_png),
+                        processed: Some(index + 1),
+                        failed: Some(failed),
+                        skipped_duplicates: Some(skipped_duplicates),
+                        cache_hits: Some(cache_hits),
+                        processed_new: Some(processed_new),
+                        current_file: Some(source.display_path.clone()),
+                        message: Some(format!(
+                            "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张，已去重跳过 {} 张（{}）",
+                            index + 1,
+                            total_png,
+                            cache_hits,
+                            processed_new,
+                            skipped_duplicates,
+                            duplicate.reason
+                        )),
+                    },
+                );
+                continue;
+            }
+
+            let thumbnail_result = thumbnail_for_row(
+                &source,
+                &mut image_state,
+                cache.as_ref(),
+                &temp_dir.path,
+                index,
+            );
+            if thumbnail_result.1 {
+                cache_record_dirty = true;
+            }
+
+            match thumbnail_result.0 {
+                Ok(thumbnail_path) if !file_failed => {
+                    let row_index = rows.len();
+                    remember_dedup_group(
+                        &source,
+                        row_index,
+                        &image_state.metadata.positive_prompt,
+                        &image_state.metadata.artist_tags,
+                        options,
+                        &mut duplicate_groups,
+                        &mut positive_prompt_groups,
+                        &mut artist_string_groups,
+                    );
+                    rows.push(WorkbookRow {
+                        thumbnail_path,
+                        source_path: source_path_for_xlsx(
+                            input_path,
+                            prepared_input.cache_match_mode,
+                            &source,
+                        ),
+                        sort_time: source.sort_time,
+                        sort_time_text: format_time_for_xlsx(source.sort_time),
+                        positive_prompt: image_state.metadata.positive_prompt.clone(),
+                        negative_prompt: image_state.metadata.negative_prompt.clone(),
+                        artist_tags: image_state.metadata.artist_tags.clone(),
+                        duplicate_folder: String::new(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    file_failed = true;
+                    let warning = FileWarning::new(
+                        source.display_path.clone(),
+                        format!("无法创建缩略图：{error}"),
+                    );
+                    progress.emit_warning(&warning);
+                    warnings.push(warning);
+                }
             }
 
             if cache_record_dirty {
                 if let Some(cache_store) = cache.as_mut() {
-                    cache_store.save_record(cache_record_from_state(source, &image_state))?;
+                    cache_store.save_record(cache_record_from_state(&source, &image_state))?;
                 }
+            }
+
+            if file_failed {
+                failure_folder_writer.remember_failed_source(&source);
+                failed += 1;
             }
 
             progress.emit_progress(
@@ -406,99 +523,125 @@ pub fn run_extraction_with_options(
                     processed_new: Some(processed_new),
                     current_file: Some(source.display_path.clone()),
                     message: Some(format!(
-                        "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张，已去重跳过 {} 张（{}）",
+                        "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张",
                         index + 1,
                         total_png,
                         cache_hits,
-                        processed_new,
-                        skipped_duplicates,
-                        duplicate.reason
+                        processed_new
                     )),
                 },
             );
-            continue;
+        }
+    } else {
+        if total_png > 0 {
+            progress.emit_progress(
+                "extract:file_progress",
+                ProgressPayload {
+                    total_png: Some(total_png),
+                    processed: Some(0),
+                    failed: Some(0),
+                    skipped_duplicates: Some(0),
+                    cache_hits: Some(0),
+                    processed_new: Some(0),
+                    current_file: None,
+                    message: Some(format!(
+                        "正在使用 {worker_count} 个线程读取元数据并生成缩略图..."
+                    )),
+                },
+            );
         }
 
-        let thumbnail_result = thumbnail_for_row(
-            source,
-            &mut image_state,
+        let processed_images = process_images_without_dedupe_parallel(
+            &images,
             cache.as_ref(),
+            prepared_input.cache_match_mode,
             &temp_dir.path,
-            index,
+            worker_count,
         );
-        if thumbnail_result.1 {
-            cache_record_dirty = true;
-        }
 
-        match thumbnail_result.0 {
-            Ok(thumbnail_path) => {
-                let row_index = rows.len();
-                remember_dedup_group(
-                    source,
-                    row_index,
-                    &image_state.metadata.positive_prompt,
-                    &image_state.metadata.artist_tags,
-                    options,
-                    &mut duplicate_groups,
-                    &mut positive_prompt_groups,
-                    &mut artist_string_groups,
-                );
-                rows.push(WorkbookRow {
-                    thumbnail_path,
-                    source_path: source_path_for_xlsx(
-                        input_path,
-                        prepared_input.cache_match_mode,
-                        source,
-                    ),
-                    sort_time: source.sort_time,
-                    sort_time_text: format_time_for_xlsx(source.sort_time),
-                    positive_prompt: image_state.metadata.positive_prompt.clone(),
-                    negative_prompt: image_state.metadata.negative_prompt.clone(),
-                    artist_tags: image_state.metadata.artist_tags.clone(),
-                    duplicate_folder: String::new(),
-                });
+        for (index, processed_image) in processed_images.into_iter().enumerate() {
+            let ProcessedImage {
+                source,
+                image_state,
+                cache_hit,
+                cache_record_dirty,
+                thumbnail_result,
+            } = processed_image;
+
+            if cache_hit {
+                cache_hits += 1;
+            } else {
+                processed_new += 1;
             }
-            Err(error) => {
-                file_failed = true;
-                let warning = FileWarning::new(
-                    source.display_path.clone(),
-                    format!("无法创建缩略图：{error}"),
-                );
+
+            let mut file_failed = image_state.metadata_failed;
+
+            if let Some(message) = image_state.metadata_warning.clone() {
+                let warning = FileWarning::new(source.display_path.clone(), message);
                 progress.emit_warning(&warning);
                 warnings.push(warning);
             }
-        }
 
-        if cache_record_dirty {
-            if let Some(cache_store) = cache.as_mut() {
-                cache_store.save_record(cache_record_from_state(source, &image_state))?;
+            match thumbnail_result {
+                Ok(thumbnail_path) if !file_failed => {
+                    rows.push(WorkbookRow {
+                        thumbnail_path,
+                        source_path: source_path_for_xlsx(
+                            input_path,
+                            prepared_input.cache_match_mode,
+                            &source,
+                        ),
+                        sort_time: source.sort_time,
+                        sort_time_text: format_time_for_xlsx(source.sort_time),
+                        positive_prompt: image_state.metadata.positive_prompt.clone(),
+                        negative_prompt: image_state.metadata.negative_prompt.clone(),
+                        artist_tags: image_state.metadata.artist_tags.clone(),
+                        duplicate_folder: String::new(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    file_failed = true;
+                    let warning = FileWarning::new(
+                        source.display_path.clone(),
+                        format!("无法创建缩略图：{error}"),
+                    );
+                    progress.emit_warning(&warning);
+                    warnings.push(warning);
+                }
             }
-        }
 
-        if file_failed {
-            failure_folder_writer.remember_failed_source(source);
-            failed += 1;
-        }
+            if cache_record_dirty {
+                if let Some(cache_store) = cache.as_mut() {
+                    cache_store.save_record(cache_record_from_state(&source, &image_state))?;
+                }
+            }
 
-        progress.emit_progress(
-            "extract:file_progress",
-            ProgressPayload {
-                total_png: Some(total_png),
-                processed: Some(index + 1),
-                failed: Some(failed),
-                skipped_duplicates: Some(skipped_duplicates),
-                cache_hits: Some(cache_hits),
-                processed_new: Some(processed_new),
-                current_file: Some(source.display_path.clone()),
-                message: Some(format!(
-                    "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张",
-                    index + 1,
-                    total_png,
-                    cache_hits,
-                    processed_new
-                )),
-            },
-        );
+            if file_failed {
+                failure_folder_writer.remember_failed_source(&source);
+                failed += 1;
+            }
+
+            progress.emit_progress(
+                "extract:file_progress",
+                ProgressPayload {
+                    total_png: Some(total_png),
+                    processed: Some(index + 1),
+                    failed: Some(failed),
+                    skipped_duplicates: Some(skipped_duplicates),
+                    cache_hits: Some(cache_hits),
+                    processed_new: Some(processed_new),
+                    current_file: Some(source.display_path.clone()),
+                    message: Some(format!(
+                        "正在处理 {} / {}，缓存复用 {} 张，新处理 {} 张",
+                        index + 1,
+                        total_png,
+                        cache_hits,
+                        processed_new
+                    )),
+                },
+            );
+        }
     }
 
     duplicate_folder_writer
@@ -546,6 +689,166 @@ struct ImageProcessingState {
     metadata_failed: bool,
     thumbnail_file_name: Option<String>,
     thumbnail_error: Option<String>,
+}
+
+struct LoadedImage {
+    source: SourceImage,
+    image_state: ImageProcessingState,
+    cache_hit: bool,
+    cache_record_dirty: bool,
+}
+
+struct ProcessedImage {
+    source: SourceImage,
+    image_state: ImageProcessingState,
+    cache_hit: bool,
+    cache_record_dirty: bool,
+    thumbnail_result: Result<PathBuf>,
+}
+
+fn dedupe_enabled(options: ExtractionOptions) -> bool {
+    options.dedupe_positive_prompt || options.dedupe_artist_tags
+}
+
+fn image_worker_count(image_count: usize) -> usize {
+    if image_count == 0 {
+        return 0;
+    }
+
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(MAX_IMAGE_WORKER_THREADS)
+        .min(image_count)
+        .max(1)
+}
+
+fn worker_count_description(worker_count: usize) -> String {
+    if worker_count == 0 {
+        "无需启动处理线程".to_string()
+    } else {
+        format!("使用 {worker_count} 个处理线程")
+    }
+}
+
+fn load_image_states_parallel(
+    images: &[SourceImage],
+    cache: Option<&CacheStore>,
+    cache_match_mode: CacheMatchMode,
+    worker_count: usize,
+) -> Vec<LoadedImage> {
+    parallel_map_sources(images, worker_count, |_, source| {
+        load_image_state(source, cache, cache_match_mode)
+    })
+}
+
+fn process_images_without_dedupe_parallel(
+    images: &[SourceImage],
+    cache: Option<&CacheStore>,
+    cache_match_mode: CacheMatchMode,
+    temp_dir: &Path,
+    worker_count: usize,
+) -> Vec<ProcessedImage> {
+    parallel_map_sources(images, worker_count, |index, source| {
+        let LoadedImage {
+            source,
+            mut image_state,
+            cache_hit,
+            mut cache_record_dirty,
+        } = load_image_state(source, cache, cache_match_mode);
+
+        let thumbnail_result = thumbnail_for_row(&source, &mut image_state, cache, temp_dir, index);
+        if thumbnail_result.1 {
+            cache_record_dirty = true;
+        }
+
+        ProcessedImage {
+            source,
+            image_state,
+            cache_hit,
+            cache_record_dirty,
+            thumbnail_result: thumbnail_result.0,
+        }
+    })
+}
+
+fn parallel_map_sources<T, F>(images: &[SourceImage], worker_count: usize, worker: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, SourceImage) -> T + Sync,
+{
+    if images.is_empty() {
+        return Vec::new();
+    }
+
+    if worker_count <= 1 {
+        return images
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, source)| worker(index, source))
+            .collect();
+    }
+
+    let jobs = Arc::new(Mutex::new(
+        images.iter().cloned().enumerate().collect::<VecDeque<_>>(),
+    ));
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let jobs = Arc::clone(&jobs);
+            let sender = sender.clone();
+            let worker = &worker;
+
+            scope.spawn(move || loop {
+                let job = jobs
+                    .lock()
+                    .expect("image worker queue should not be poisoned")
+                    .pop_front();
+                let Some((index, source)) = job else {
+                    break;
+                };
+
+                if sender.send((index, worker(index, source))).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(sender);
+
+        let mut results = (0..images.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, result) in receiver {
+            results[index] = Some(result);
+        }
+
+        results
+            .into_iter()
+            .map(|result| result.expect("image worker should return one result per image"))
+            .collect()
+    })
+}
+
+fn load_image_state(
+    source: SourceImage,
+    cache: Option<&CacheStore>,
+    cache_match_mode: CacheMatchMode,
+) -> LoadedImage {
+    let mut image_state = cached_image_state(&source, cache, cache_match_mode);
+    let mut cache_record_dirty = false;
+    let cache_hit = image_state.is_some();
+
+    if image_state.is_none() {
+        image_state = Some(read_image_metadata(&source));
+        cache_record_dirty = cache.is_some();
+    }
+
+    LoadedImage {
+        source,
+        image_state: image_state.expect("image state should be loaded or cached"),
+        cache_hit,
+        cache_record_dirty,
+    }
 }
 
 fn cached_image_state(
@@ -1641,7 +1944,7 @@ mod tests {
         let actual_output = actual_output_path(&summary);
         assert!(!output.exists());
         assert!(actual_output.exists());
-        assert_xlsx_has_media(&actual_output);
+        assert_xlsx_media_count(&actual_output, 0);
         assert_duplicate_folder_contains(
             &actual_output.parent().unwrap().join("_Fail"),
             &["plain.png"],
@@ -1894,16 +2197,6 @@ mod tests {
             .replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
-    }
-
-    fn assert_xlsx_has_media(output: &Path) {
-        let file = File::open(output).unwrap();
-        let mut archive = zip::ZipArchive::new(file).unwrap();
-        let names = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
-            .collect::<Vec<_>>();
-
-        assert!(names.iter().any(|name| name.starts_with("xl/media/")));
     }
 
     fn assert_xlsx_media_count(output: &Path, expected_count: usize) {
