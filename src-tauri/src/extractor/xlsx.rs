@@ -15,7 +15,7 @@ pub struct WorkbookRow {
     pub positive_prompt: String,
     pub negative_prompt: String,
     pub artist_tags: Vec<String>,
-    pub duplicate_folder: String,
+    pub image_folder: String,
 }
 
 pub fn write_xlsx(
@@ -41,7 +41,7 @@ pub fn write_xlsx(
         let positive_prompt_column = 1 + time_column_offset;
         let negative_prompt_column = 2 + time_column_offset;
         let artist_tags_column = 3 + time_column_offset;
-        let duplicate_folder_column = 4 + time_column_offset;
+        let image_folder_column = 4 + time_column_offset;
         let source_path_column = 5 + time_column_offset;
 
         worksheet.set_column_width_pixels(0, THUMBNAIL_CELL_PIXELS)?;
@@ -51,7 +51,7 @@ pub fn write_xlsx(
         worksheet.set_column_width(positive_prompt_column, 64)?;
         worksheet.set_column_width(negative_prompt_column, 48)?;
         worksheet.set_column_width(artist_tags_column, 34)?;
-        worksheet.set_column_width(duplicate_folder_column, 18)?;
+        worksheet.set_column_width(image_folder_column, 18)?;
         worksheet.set_column_width(source_path_column, 58)?;
         worksheet.set_row_height_pixels(0, 28)?;
 
@@ -72,12 +72,7 @@ pub fn write_xlsx(
             &header_format,
         )?;
         worksheet.write_string_with_format(0, artist_tags_column, "画师串", &header_format)?;
-        worksheet.write_string_with_format(
-            0,
-            duplicate_folder_column,
-            "重复文件夹",
-            &header_format,
-        )?;
+        worksheet.write_string_with_format(0, image_folder_column, "图片文件夹", &header_format)?;
         worksheet.write_string_with_format(0, source_path_column, "图片路径", &header_format)?;
 
         for (index, row) in rows.iter().enumerate() {
@@ -115,11 +110,11 @@ pub fn write_xlsx(
                 truncate_for_excel(&row.artist_tags.join("\n")),
                 &text_format,
             )?;
-            if !row.duplicate_folder.is_empty() {
+            if !row.image_folder.is_empty() {
                 worksheet.write_string_with_format(
                     row_number,
-                    duplicate_folder_column,
-                    truncate_for_excel(&row.duplicate_folder),
+                    image_folder_column,
+                    truncate_for_excel(&row.image_folder),
                     &text_format,
                 )?;
             }

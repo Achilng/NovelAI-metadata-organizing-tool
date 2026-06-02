@@ -109,17 +109,16 @@ struct DuplicateMatch {
 }
 
 #[derive(Debug, Clone)]
-struct DuplicateGroup {
+struct ImageFolderGroup {
     row_index: usize,
     representative_path: PathBuf,
     representative_display_path: String,
     duplicate_sources: Vec<SourceImage>,
     sort_time: Option<SystemTime>,
-    folder_name: Option<String>,
     copied_count: usize,
 }
 
-struct DuplicateFolderWriter {
+struct ImageFolderWriter {
     output_dir: PathBuf,
     next_folder_number: usize,
 }
@@ -131,7 +130,7 @@ struct FailureFolderWriter {
     copied_count: usize,
 }
 
-impl DuplicateFolderWriter {
+impl ImageFolderWriter {
     fn new(output_path: &Path) -> Self {
         Self {
             output_dir: output_directory(output_path),
@@ -139,23 +138,20 @@ impl DuplicateFolderWriter {
         }
     }
 
-    fn write_duplicate_folders(
+    fn write_image_folders(
         &mut self,
-        groups: &mut [DuplicateGroup],
+        groups: &mut [ImageFolderGroup],
         rows: &mut [WorkbookRow],
         sort_by_time: bool,
     ) -> Result<()> {
-        for group in groups
-            .iter_mut()
-            .filter(|group| !group.duplicate_sources.is_empty())
-        {
+        for group in groups.iter_mut() {
             let (folder_name, folder_path) = self.create_folder(group.sort_time, sort_by_time)?;
             copy_source_to_numbered_folder(
                 &group.representative_path,
                 &group.representative_display_path,
                 &folder_path,
                 &mut group.copied_count,
-                "重复图片",
+                "图片",
             )?;
 
             for source in &group.duplicate_sources {
@@ -164,12 +160,11 @@ impl DuplicateFolderWriter {
                     &source.display_path,
                     &folder_path,
                     &mut group.copied_count,
-                    "重复图片",
+                    "图片",
                 )?;
             }
 
-            rows[group.row_index].duplicate_folder = format!("{folder_name}/");
-            group.folder_name = Some(folder_name);
+            rows[group.row_index].image_folder = format!("{folder_name}/");
         }
 
         Ok(())
@@ -191,7 +186,7 @@ impl DuplicateFolderWriter {
             }
 
             fs::create_dir(&folder_path)
-                .with_context(|| format!("无法创建重复图片文件夹：{}", folder_path.display()))?;
+                .with_context(|| format!("无法创建图片文件夹：{}", folder_path.display()))?;
             return Ok((folder_name, folder_path));
         }
     }
@@ -352,8 +347,8 @@ pub fn run_extraction_with_options(
     let mut processed_new = 0_usize;
     let mut positive_prompt_groups = HashMap::new();
     let mut artist_string_groups = HashMap::new();
-    let mut duplicate_groups: Vec<DuplicateGroup> = Vec::new();
-    let mut duplicate_folder_writer = DuplicateFolderWriter::new(&output_path);
+    let mut image_folder_groups: Vec<ImageFolderGroup> = Vec::new();
+    let mut image_folder_writer = ImageFolderWriter::new(&output_path);
     let mut failure_folder_writer = FailureFolderWriter::new(&output_path);
 
     if dedupe_enabled(options) {
@@ -411,7 +406,7 @@ pub fn run_extraction_with_options(
             ) {
                 skipped_duplicates += 1;
 
-                let group = &mut duplicate_groups[duplicate.group_index];
+                let group = &mut image_folder_groups[duplicate.group_index];
                 group.sort_time = earliest_sort_time(group.sort_time, source.sort_time);
                 group.duplicate_sources.push(source.clone());
 
@@ -464,13 +459,13 @@ pub fn run_extraction_with_options(
             match thumbnail_result.0 {
                 Ok(thumbnail_path) if !file_failed => {
                     let row_index = rows.len();
-                    remember_dedup_group(
+                    remember_image_folder_group(
                         &source,
                         row_index,
                         &image_state.metadata.positive_prompt,
                         &image_state.metadata.artist_tags,
                         options,
-                        &mut duplicate_groups,
+                        &mut image_folder_groups,
                         &mut positive_prompt_groups,
                         &mut artist_string_groups,
                     );
@@ -486,7 +481,7 @@ pub fn run_extraction_with_options(
                         positive_prompt: image_state.metadata.positive_prompt.clone(),
                         negative_prompt: image_state.metadata.negative_prompt.clone(),
                         artist_tags: image_state.metadata.artist_tags.clone(),
-                        duplicate_folder: String::new(),
+                        image_folder: String::new(),
                     });
                 }
                 Ok(_) => {}
@@ -584,6 +579,17 @@ pub fn run_extraction_with_options(
 
             match thumbnail_result {
                 Ok(thumbnail_path) if !file_failed => {
+                    let row_index = rows.len();
+                    remember_image_folder_group(
+                        &source,
+                        row_index,
+                        &image_state.metadata.positive_prompt,
+                        &image_state.metadata.artist_tags,
+                        options,
+                        &mut image_folder_groups,
+                        &mut positive_prompt_groups,
+                        &mut artist_string_groups,
+                    );
                     rows.push(WorkbookRow {
                         thumbnail_path,
                         source_path: source_path_for_xlsx(
@@ -596,7 +602,7 @@ pub fn run_extraction_with_options(
                         positive_prompt: image_state.metadata.positive_prompt.clone(),
                         negative_prompt: image_state.metadata.negative_prompt.clone(),
                         artist_tags: image_state.metadata.artist_tags.clone(),
-                        duplicate_folder: String::new(),
+                        image_folder: String::new(),
                     });
                 }
                 Ok(_) => {}
@@ -644,9 +650,9 @@ pub fn run_extraction_with_options(
         }
     }
 
-    duplicate_folder_writer
-        .write_duplicate_folders(&mut duplicate_groups, &mut rows, options.sort_by_time)
-        .context("无法写入重复图片文件夹")?;
+    image_folder_writer
+        .write_image_folders(&mut image_folder_groups, &mut rows, options.sort_by_time)
+        .context("无法写入图片文件夹")?;
     failure_folder_writer
         .write_failed_sources(options.sort_by_time)
         .context("无法写入失败图片文件夹")?;
@@ -1010,13 +1016,13 @@ fn duplicate_match(
     None
 }
 
-fn remember_dedup_group(
+fn remember_image_folder_group(
     source: &SourceImage,
     row_index: usize,
     positive_prompt: &str,
     artist_tags: &[String],
     options: ExtractionOptions,
-    duplicate_groups: &mut Vec<DuplicateGroup>,
+    image_folder_groups: &mut Vec<ImageFolderGroup>,
     positive_prompt_groups: &mut HashMap<String, usize>,
     artist_string_groups: &mut HashMap<String, usize>,
 ) {
@@ -1029,18 +1035,13 @@ fn remember_dedup_group(
         .then(|| artist_tags_key(artist_tags))
         .flatten();
 
-    if positive_key.is_none() && artist_key.is_none() {
-        return;
-    }
-
-    let group_index = duplicate_groups.len();
-    duplicate_groups.push(DuplicateGroup {
+    let group_index = image_folder_groups.len();
+    image_folder_groups.push(ImageFolderGroup {
         row_index,
         representative_path: source.absolute_path.clone(),
         representative_display_path: source.display_path.clone(),
         duplicate_sources: Vec::new(),
         sort_time: source.sort_time,
-        folder_name: None,
         copied_count: 0,
     });
 
@@ -1496,15 +1497,23 @@ mod tests {
         assert_xlsx_contains(
             &actual_output,
             &[
+                "图片文件夹",
                 "图片路径",
+                "image1/",
                 &png_path_text,
                 "best quality, artist:demo",
                 "bad hands",
             ],
         );
+        assert_xlsx_cell_text(&actual_output, "E1", "图片文件夹");
+        assert_xlsx_cell_text(&actual_output, "E2", "image1/");
         assert_xlsx_cell_text(&actual_output, "F1", "图片路径");
         assert_xlsx_cell_text(&actual_output, "F2", &png_path_text);
         assert!(!root.join("image1").exists());
+        assert_duplicate_folder_contains(
+            &actual_output.parent().unwrap().join("image1"),
+            &["sample.png"],
+        );
         assert!(!actual_output.parent().unwrap().join("_Fail").exists());
 
         fs::remove_dir_all(root).unwrap();
@@ -1793,6 +1802,63 @@ mod tests {
             &actual_output_dir.join("image1"),
             &["first.png", "second.png"],
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dedupe_outputs_unique_rows_to_their_own_folders() {
+        let root = test_root("dedupe_outputs_unique_rows_to_their_own_folders");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "same prompt, artist:first");
+
+        let second_png = input.join("second.png");
+        create_test_png(&second_png);
+        insert_text_chunk(&second_png, "Description", "same prompt, artist:first");
+
+        let third_png = input.join("third.png");
+        create_colored_test_png(&third_png, [72, 143, 91]);
+        insert_text_chunk(&third_png, "Description", "unique prompt, artist:solo");
+
+        let output = root.join("metadata.xlsx");
+        let summary = run_extraction_with_options(
+            &input,
+            &output,
+            ExtractionOptions {
+                dedupe_positive_prompt: true,
+                dedupe_artist_tags: false,
+                sort_by_time: false,
+                incremental: false,
+            },
+            &NoopProgressSink,
+        )
+        .unwrap();
+
+        assert_eq!(summary.total_png, 3);
+        assert_eq!(summary.processed, 3);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+        let actual_output = actual_output_path(&summary);
+        let actual_output_dir = actual_output.parent().unwrap();
+        assert_xlsx_media_count(&actual_output, 2);
+        assert_xlsx_contains(
+            &actual_output,
+            &[
+                "same prompt, artist:first",
+                "unique prompt, artist:solo",
+                "image1/",
+                "image2/",
+            ],
+        );
+        assert_duplicate_folder_contains(
+            &actual_output_dir.join("image1"),
+            &["first.png", "second.png"],
+        );
+        assert_duplicate_folder_contains(&actual_output_dir.join("image2"), &["third.png"]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2098,7 +2164,7 @@ mod tests {
             positive_prompt: String::new(),
             negative_prompt: String::new(),
             artist_tags: Vec::new(),
-            duplicate_folder: String::new(),
+            image_folder: String::new(),
         }
     }
 
