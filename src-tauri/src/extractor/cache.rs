@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const CACHE_DIR_NAME: &str = ".novelai_metadata_cache";
 const CACHE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,8 +16,8 @@ pub struct FileFingerprint {
 
 impl FileFingerprint {
     pub fn from_path(path: &Path) -> Result<Self> {
-        let metadata =
-            fs::metadata(path).with_context(|| format!("无法读取文件信息：{}", path.display()))?;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Failed to read file info: {}", path.display()))?;
 
         Ok(Self {
             size: metadata.len(),
@@ -60,25 +61,32 @@ impl CacheStore {
     ) -> Result<Self> {
         let input_identity = input_identity(input_path);
         let cache_key = cache_key(&input_identity, archive_fingerprint);
-        let root = output_parent
-            .join(".novelai_metadata_cache")
-            .join(cache_key);
+        let root = output_parent.join(CACHE_DIR_NAME).join(cache_key);
         let records_dir = root.join("records");
         let thumbnails_dir = root.join("thumbnails");
 
-        fs::create_dir_all(&records_dir)
-            .with_context(|| format!("无法创建缓存记录目录：{}", records_dir.display()))?;
-        fs::create_dir_all(&thumbnails_dir)
-            .with_context(|| format!("无法创建缩略图缓存目录：{}", thumbnails_dir.display()))?;
+        fs::create_dir_all(&records_dir).with_context(|| {
+            format!(
+                "Failed to create cache records dir: {}",
+                records_dir.display()
+            )
+        })?;
+        fs::create_dir_all(&thumbnails_dir).with_context(|| {
+            format!(
+                "Failed to create cache thumbnails dir: {}",
+                thumbnails_dir.display()
+            )
+        })?;
 
         let manifest = CacheManifest {
             version: CACHE_SCHEMA_VERSION,
             input_identity,
             archive_fingerprint,
         };
-        let manifest_json = serde_json::to_vec_pretty(&manifest).context("无法序列化缓存清单")?;
+        let manifest_json =
+            serde_json::to_vec_pretty(&manifest).context("Failed to serialize cache manifest")?;
         fs::write(root.join("manifest.json"), manifest_json)
-            .with_context(|| format!("无法写入缓存清单：{}", root.display()))?;
+            .with_context(|| format!("Failed to write cache manifest: {}", root.display()))?;
 
         let records = load_records(&records_dir)?;
 
@@ -98,11 +106,16 @@ impl CacheStore {
     }
 
     pub fn save_record(&mut self, record: CachedImageRecord) -> Result<()> {
-        let record_path = self.record_path(&record.display_path);
-        let record_json = serde_json::to_vec(&record).context("无法序列化缓存记录")?;
-        fs::write(&record_path, record_json)
-            .with_context(|| format!("无法写入缓存记录：{}", record_path.display()))?;
+        self.save_record_file(&record)?;
         self.records.insert(record.display_path.clone(), record);
+        Ok(())
+    }
+
+    pub fn save_record_file(&self, record: &CachedImageRecord) -> Result<()> {
+        let record_path = self.record_path(&record.display_path);
+        let record_json = serde_json::to_vec(record).context("Failed to serialize cache record")?;
+        fs::write(&record_path, record_json)
+            .with_context(|| format!("Failed to write cache record: {}", record_path.display()))?;
         Ok(())
     }
 
@@ -150,10 +163,11 @@ fn load_records(records_dir: &Path) -> Result<HashMap<String, CachedImageRecord>
     let mut records = HashMap::new();
 
     for entry in fs::read_dir(records_dir)
-        .with_context(|| format!("无法读取缓存目录：{}", records_dir.display()))?
+        .with_context(|| format!("Failed to read cache dir: {}", records_dir.display()))?
     {
-        let entry =
-            entry.with_context(|| format!("无法读取缓存目录项：{}", records_dir.display()))?;
+        let entry = entry.with_context(|| {
+            format!("Failed to read cache dir entry: {}", records_dir.display())
+        })?;
         if !entry
             .file_type()
             .map(|file_type| file_type.is_file())

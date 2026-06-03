@@ -1,4 +1,4 @@
-use super::cache::{CacheStore, CachedImageRecord, FileFingerprint};
+use super::cache::{CacheStore, CachedImageRecord, FileFingerprint, CACHE_DIR_NAME};
 use super::metadata::{parse_novelai_metadata, NovelAiMetadata};
 use super::png_text::read_png_text_chunks;
 use super::xlsx::{write_xlsx, WorkbookRow};
@@ -22,6 +22,7 @@ const THUMBNAIL_SIZE: u32 = 160;
 const TEMP_ROOT: &str = r"D:\Agent\Agent_temp";
 const MISSING_TIME_FOLDER_PREFIX: &str = "9999-12-31_235959";
 const MAX_IMAGE_WORKER_THREADS: usize = 8;
+const OUTPUT_MARKER_FILE_NAME: &str = ".novelai_metadata_output";
 static RUN_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,7 +300,7 @@ pub fn run_extraction_with_options(
 
     let temp_dir = RunTempDir::create()?;
     let prepared_input = prepare_input(input_path, &temp_dir.path)?;
-    let images = collect_png_files(&prepared_input.path)?;
+    let images = collect_png_files(&prepared_input.path, output_path)?;
     let total_png = images.len();
     let worker_count = image_worker_count(total_png);
     let worker_count_description = worker_count_description(worker_count);
@@ -381,7 +382,7 @@ pub fn run_extraction_with_options(
                 mut image_state,
                 cache_hit,
                 mut cache_record_dirty,
-            } = loaded_image;
+            } = loaded_image?;
 
             if cache_hit {
                 cache_hits += 1;
@@ -561,7 +562,7 @@ pub fn run_extraction_with_options(
                 cache_hit,
                 cache_record_dirty,
                 thumbnail_result,
-            } = processed_image;
+            } = processed_image?;
 
             if cache_hit {
                 cache_hits += 1;
@@ -742,7 +743,7 @@ fn load_image_states_parallel(
     cache: Option<&CacheStore>,
     cache_match_mode: CacheMatchMode,
     worker_count: usize,
-) -> Vec<LoadedImage> {
+) -> Vec<Result<LoadedImage>> {
     parallel_map_sources(images, worker_count, |_, source| {
         load_image_state(source, cache, cache_match_mode)
     })
@@ -754,27 +755,34 @@ fn process_images_without_dedupe_parallel(
     cache_match_mode: CacheMatchMode,
     temp_dir: &Path,
     worker_count: usize,
-) -> Vec<ProcessedImage> {
+) -> Vec<Result<ProcessedImage>> {
     parallel_map_sources(images, worker_count, |index, source| {
         let LoadedImage {
             source,
             mut image_state,
             cache_hit,
             mut cache_record_dirty,
-        } = load_image_state(source, cache, cache_match_mode);
+        } = load_image_state(source, cache, cache_match_mode)?;
 
         let thumbnail_result = thumbnail_for_row(&source, &mut image_state, cache, temp_dir, index);
         if thumbnail_result.1 {
             cache_record_dirty = true;
         }
 
-        ProcessedImage {
+        if cache_record_dirty {
+            if let Some(cache_store) = cache {
+                cache_store.save_record_file(&cache_record_from_state(&source, &image_state))?;
+            }
+            cache_record_dirty = false;
+        }
+
+        Ok(ProcessedImage {
             source,
             image_state,
             cache_hit,
             cache_record_dirty,
             thumbnail_result: thumbnail_result.0,
-        }
+        })
     })
 }
 
@@ -839,22 +847,27 @@ fn load_image_state(
     source: SourceImage,
     cache: Option<&CacheStore>,
     cache_match_mode: CacheMatchMode,
-) -> LoadedImage {
-    let mut image_state = cached_image_state(&source, cache, cache_match_mode);
-    let mut cache_record_dirty = false;
-    let cache_hit = image_state.is_some();
-
-    if image_state.is_none() {
-        image_state = Some(read_image_metadata(&source));
-        cache_record_dirty = cache.is_some();
+) -> Result<LoadedImage> {
+    if let Some(image_state) = cached_image_state(&source, cache, cache_match_mode) {
+        return Ok(LoadedImage {
+            source,
+            image_state,
+            cache_hit: true,
+            cache_record_dirty: false,
+        });
     }
 
-    LoadedImage {
+    let image_state = read_image_metadata(&source);
+    if let Some(cache_store) = cache {
+        cache_store.save_record_file(&cache_record_from_state(&source, &image_state))?;
+    }
+
+    Ok(LoadedImage {
         source,
-        image_state: image_state.expect("image state should be loaded or cached"),
-        cache_hit,
-        cache_record_dirty,
-    }
+        image_state,
+        cache_hit: false,
+        cache_record_dirty: false,
+    })
 }
 
 fn cached_image_state(
@@ -1168,13 +1181,29 @@ fn prepare_output_package(requested_output_path: &Path) -> Result<PathBuf> {
     let parent_dir = output_directory(requested_output_path);
     let folder_name = output_package_folder_name(requested_output_path);
     let output_dir = create_unique_output_dir(&parent_dir, &folder_name)?;
-    let file_name = requested_output_path
+    write_output_package_marker(&output_dir)?;
+    let file_name = output_package_file_name(requested_output_path);
+
+    Ok(output_dir.join(file_name))
+}
+
+fn write_output_package_marker(output_dir: &Path) -> Result<()> {
+    let marker_path = output_dir.join(OUTPUT_MARKER_FILE_NAME);
+    fs::write(&marker_path, b"NovelAI metadata organizer output\n").with_context(|| {
+        format!(
+            "Failed to write output package marker: {}",
+            marker_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn output_package_file_name(requested_output_path: &Path) -> String {
+    requested_output_path
         .file_name()
         .map(|value| sanitize_file_name(&value.to_string_lossy()))
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "novelai_metadata.xlsx".to_string());
-
-    Ok(output_dir.join(file_name))
+        .unwrap_or_else(|| "novelai_metadata.xlsx".to_string())
 }
 
 fn output_package_folder_name(requested_output_path: &Path) -> String {
@@ -1276,7 +1305,72 @@ fn validate_paths(input_path: &Path, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
+struct ScanExclusions {
+    output_parent: PathBuf,
+    output_parent_inside_input: bool,
+    output_folder_name: String,
+    output_file_name: String,
+}
+
+impl ScanExclusions {
+    fn new(input_path: &Path, requested_output_path: &Path) -> Self {
+        let input_root = canonical_or_original(input_path);
+        let output_parent = canonical_or_original(&output_directory(requested_output_path));
+        let output_parent_inside_input =
+            output_parent == input_root || output_parent.starts_with(&input_root);
+
+        Self {
+            output_parent,
+            output_parent_inside_input,
+            output_folder_name: output_package_folder_name(requested_output_path),
+            output_file_name: output_package_file_name(requested_output_path),
+        }
+    }
+}
+
+fn should_skip_scan_entry(entry: &walkdir::DirEntry, exclusions: &ScanExclusions) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return false;
+    }
+
+    let file_name = entry.file_name().to_string_lossy();
+    if file_name.eq_ignore_ascii_case(CACHE_DIR_NAME) {
+        return true;
+    }
+
+    if !exclusions.output_parent_inside_input
+        || !is_direct_child_of_output_parent(entry.path(), &exclusions.output_parent)
+        || !is_output_package_dir_name(&file_name, &exclusions.output_folder_name)
+    {
+        return false;
+    }
+
+    entry.path().join(OUTPUT_MARKER_FILE_NAME).exists()
+        || entry.path().join(&exclusions.output_file_name).is_file()
+}
+
+fn is_direct_child_of_output_parent(path: &Path, output_parent: &Path) -> bool {
+    path.parent()
+        .map(canonical_or_original)
+        .is_some_and(|parent| parent == output_parent)
+}
+
+fn is_output_package_dir_name(dir_name: &str, base_name: &str) -> bool {
+    if dir_name == base_name {
+        return true;
+    }
+
+    dir_name
+        .strip_prefix(base_name)
+        .and_then(|suffix| suffix.strip_prefix('_'))
+        .is_some_and(|number| !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn collect_png_files(input_path: &Path, requested_output_path: &Path) -> Result<Vec<SourceImage>> {
     if input_path.is_file() {
         if is_png(input_path) {
             let display_path = input_path
@@ -1297,8 +1391,12 @@ fn collect_png_files(input_path: &Path) -> Result<Vec<SourceImage>> {
         bail!("输入路径必须是文件夹、PNG 文件或受支持的压缩包。");
     }
 
+    let exclusions = ScanExclusions::new(input_path, requested_output_path);
     let mut images = Vec::new();
-    for entry in WalkDir::new(input_path) {
+    for entry in WalkDir::new(input_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_scan_entry(entry, &exclusions))
+    {
         let entry = entry.with_context(|| format!("无法扫描目录：{}", input_path.display()))?;
         if !entry.file_type().is_file() || !is_png(entry.path()) {
             continue;
@@ -1455,9 +1553,11 @@ fn create_thumbnail_at(source_path: &Path, thumbnail_path: &Path) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::cache::CacheStore;
     use super::super::xlsx::WorkbookRow;
     use super::{
-        output_folder_name, run_extraction, run_extraction_with_options, sort_rows_by_time,
+        collect_png_files, image_worker_count, load_image_states_parallel, output_folder_name,
+        run_extraction, run_extraction_with_options, sort_rows_by_time, CacheMatchMode,
         ExtractionOptions, NoopProgressSink, RunSummary,
     };
     use crc32fast::Hasher;
@@ -1572,6 +1672,84 @@ mod tests {
         let actual_output = actual_output_path(&second_summary);
         assert_eq!(actual_output, root.join("metadata_1").join("metadata.xlsx"));
         assert_xlsx_contains(&actual_output, &["artist:cached"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_ignores_generated_output_inside_input_folder() {
+        let root = test_root("incremental_ignores_generated_output_inside_input_folder");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let png_path = input.join("sample.png");
+        create_test_png(&png_path);
+        insert_text_chunk(&png_path, "Description", "artist:inside-output");
+
+        let output = input.join("metadata.xlsx");
+        let options = ExtractionOptions {
+            incremental: true,
+            ..ExtractionOptions::default()
+        };
+        let first_summary =
+            run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+        assert_eq!(first_summary.total_png, 1);
+        assert_eq!(first_summary.processed_new, 1);
+        assert!(input
+            .join("metadata")
+            .join(".novelai_metadata_output")
+            .exists());
+
+        let second_summary =
+            run_extraction_with_options(&input, &output, options, &NoopProgressSink).unwrap();
+        assert_eq!(second_summary.total_png, 1);
+        assert_eq!(second_summary.cache_hits, 1);
+        assert_eq!(second_summary.processed_new, 0);
+        assert_eq!(
+            actual_output_path(&second_summary),
+            input.join("metadata_1").join("metadata.xlsx")
+        );
+        assert_xlsx_contains(
+            &actual_output_path(&second_summary),
+            &["artist:inside-output"],
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incremental_persists_records_during_parallel_metadata_load() {
+        let root = test_root("incremental_persists_records_during_parallel_metadata_load");
+        let input = root.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let first_png = input.join("first.png");
+        create_test_png(&first_png);
+        insert_text_chunk(&first_png, "Description", "artist:first-cache");
+
+        let second_png = input.join("second.png");
+        create_colored_test_png(&second_png, [71, 128, 48]);
+        insert_text_chunk(&second_png, "Description", "artist:second-cache");
+
+        let output = root.join("metadata.xlsx");
+        let images = collect_png_files(&input, &output).unwrap();
+        assert_eq!(images.len(), 2);
+
+        let cache = CacheStore::open(&root, &input, None).unwrap();
+        assert_eq!(cache.record_count(), 0);
+
+        let loaded_images = load_image_states_parallel(
+            &images,
+            Some(&cache),
+            CacheMatchMode::FileSystem,
+            image_worker_count(images.len()),
+        );
+        for loaded_image in loaded_images {
+            loaded_image.unwrap();
+        }
+
+        let reopened_cache = CacheStore::open(&root, &input, None).unwrap();
+        assert_eq!(reopened_cache.record_count(), 2);
 
         fs::remove_dir_all(root).unwrap();
     }
