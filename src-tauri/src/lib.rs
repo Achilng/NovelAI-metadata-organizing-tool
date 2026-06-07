@@ -1,11 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
 
 mod extractor;
 
 use extractor::{
-    run_extraction_with_options, ExtractionOptions, FileWarning, ProgressPayload, ProgressSink,
-    RunSummary,
+    convert_xlsx_file, inspect_xlsx_file, run_extraction_with_options, ConversionProgress,
+    ConversionSummary, ExtractionOptions, FileWarning, ProgressPayload, ProgressSink, RunSummary,
+    XlsxInspection,
 };
 
 struct TauriProgressSink {
@@ -54,11 +55,66 @@ async fn extract_to_xlsx(
     .map_err(|error| error.to_string())?
 }
 
+#[tauri::command]
+async fn inspect_xlsx(input_path: String) -> Result<XlsxInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_xlsx_file(Path::new(&input_path)))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn convert_xlsx_to_zhihuiji_json(
+    app: AppHandle,
+    input_path: String,
+    output_path: String,
+) -> Result<ConversionSummary, String> {
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        convert_xlsx_file(
+            Path::new(&input_path),
+            Path::new(&output_path),
+            |payload: ConversionProgress| {
+                let _ = app_for_task.emit("convert:progress", payload);
+            },
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn open_output_folder(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let folder = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "无法确定输出文件夹。".to_string())?
+    };
+    if !folder.is_dir() {
+        return Err(format!("输出文件夹不存在：{}", folder.display()));
+    }
+
+    std::process::Command::new("explorer.exe")
+        .arg(folder)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开输出文件夹：{error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![extract_to_xlsx])
+        .invoke_handler(tauri::generate_handler![
+            extract_to_xlsx,
+            inspect_xlsx,
+            convert_xlsx_to_zhihuiji_json,
+            open_output_folder
+        ])
         .run(tauri::generate_context!())
         .expect("failed to run app");
 }

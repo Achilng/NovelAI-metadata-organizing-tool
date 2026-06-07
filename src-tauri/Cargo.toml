@@ -15,6 +15,7 @@ tauri-build = { version = "2.6.2", features = [] }
 
 [dependencies]
 anyhow = "1.0"
+calamine = "0.35.0"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 flate2 = "1.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
