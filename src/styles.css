@@ -50,6 +50,39 @@ button:disabled {
   padding: 24px;
 }
 
+.tabs {
+  background: #e9edf3;
+  border: 1px solid #d2d9e3;
+  border-radius: 8px;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(260px, 1.3fr);
+  padding: 4px;
+}
+
+.tab {
+  background: transparent;
+  border-color: transparent;
+  color: #536174;
+  font-weight: 650;
+}
+
+.tab.active {
+  background: #fff;
+  border-color: #cbd4e1;
+  color: #214e8d;
+  box-shadow: 0 1px 3px rgb(31 49 72 / 10%);
+}
+
+.tab-page {
+  display: grid;
+  gap: 14px;
+}
+
+.tab-page[hidden] {
+  display: none;
+}
+
 .topbar {
   align-items: start;
   display: flex;
@@ -96,6 +129,13 @@ p {
   display: grid;
   gap: 10px;
   grid-template-columns: max-content max-content minmax(220px, 1fr);
+}
+
+.converter-row {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: max-content minmax(220px, 1fr);
 }
 
 .path {
@@ -149,6 +189,13 @@ p {
   display: flex;
   gap: 18px;
   justify-content: space-between;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 .primary {
@@ -244,6 +291,104 @@ progress::-webkit-progress-value {
   color: #697688;
 }
 
+.mapping-panel {
+  background: #f9fbff;
+}
+
+.mapping-grid {
+  display: grid;
+  gap: 8px 16px;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+}
+
+.mapping-grid span {
+  background: #fff;
+  border: 1px solid #dbe3ef;
+  border-radius: 6px;
+  color: #586679;
+  padding: 9px 10px;
+}
+
+.mapping-grid strong {
+  color: #26364c;
+}
+
+.preview-head {
+  align-items: start;
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+}
+
+.record-badge {
+  background: #edf5ff;
+  border: 1px solid #cbdff7;
+  border-radius: 999px;
+  color: #49627e;
+  flex: none;
+  padding: 7px 12px;
+}
+
+.record-badge strong {
+  color: #214e8d;
+  margin-left: 4px;
+}
+
+.preview-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  max-height: 330px;
+  overflow: auto;
+}
+
+.empty-preview {
+  background: #f6f8fb;
+  border: 1px dashed #ccd5e2;
+  border-radius: 6px;
+  color: #697688;
+  padding: 18px;
+  text-align: center;
+}
+
+.preview-card {
+  border: 1px solid #dce2eb;
+  border-radius: 7px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.preview-index {
+  color: #214e8d;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.preview-field {
+  display: grid;
+  gap: 5px;
+}
+
+.preview-field strong {
+  color: #566477;
+  font-size: 12px;
+}
+
+.preview-field pre {
+  background: #f7f9fc;
+  border-radius: 5px;
+  color: #273446;
+  font-family: inherit;
+  line-height: 1.45;
+  margin: 0;
+  max-height: 95px;
+  overflow: auto;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (max-width: 820px) {
   body {
     min-width: 0;
@@ -254,12 +399,21 @@ progress::-webkit-progress-value {
   }
 
   .topbar,
-  .status-head {
+  .status-head,
+  .preview-head {
     display: grid;
   }
 
-  .row {
+  .row,
+  .converter-row,
+  .mapping-grid,
+  .tabs {
     grid-template-columns: 1fr;
+  }
+
+  .action-row {
+    display: grid;
+    width: 100%;
   }
 
   button {
