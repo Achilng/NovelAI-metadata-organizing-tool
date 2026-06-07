@@ -338,6 +338,22 @@ artist:sune (mugendai)
 - 启用去重时，先并行读取元数据，再按扫描顺序执行去重、缩略图生成和输出合并，避免改变代表图选择、图片文件夹编号和失败图处理规则。
 - XLSX 写入、图片文件夹写入和失败图片目录写入仍集中在主流程中串行执行，避免并发写同一输出文件或目录。
 
+## 10.3 XLSX 转智绘姬 JSON
+
+- 主界面使用两个顶部标签页：`图片整理` 和 `XLSX转智绘姬JSON格式`，两个页面的路径、状态和结果互不影响。
+- 转换页只读取 XLSX 中已经保留的记录，不重新扫描原始 PNG，也不恢复去重时被跳过的数据。
+- 选择 XLSX 后自动检查“正向提示词”和“负向提示词”表头，统计有效记录并预览前 3 条。
+- JSON 输出路径默认使用 XLSX 同目录和同文件名，并把扩展名改为 `.json`；用户可以另选路径。
+- 字段映射固定为：
+  - “正向提示词”写入 `fixedPrompt`。
+  - `fixedPrompt_end` 固定为空字符串。
+  - “负向提示词”写入 `negativePrompt`。
+  - `images` 固定为空对象。
+- 按 XLSX 行顺序使用 `1`、`2` 等连续字符串键写入 `presets`；完全空白行跳过，提示词为空但包含其他单元格数据的记录仍保留。
+- JSON 使用 UTF-8 和严格 JSON 语法，提示词中的换行、引号、反斜杠和 Unicode 字符由 JSON 序列化器转义。
+- 转换过程逐条写入同目录临时文件，成功后再替换目标文件，避免失败时留下不完整 JSON。
+- 转换期间显示已处理数量和进度，并锁定标签页和路径选择；完成后可以打开输出文件所在目录。
+
 ## 11. 后端命令设计
 
 主 Tauri 命令：
@@ -354,6 +370,19 @@ async fn extract_to_xlsx(
 ) -> Result<RunSummary, String>
 ```
 
+转换相关命令：
+
+```rust
+#[tauri::command]
+async fn inspect_xlsx(input_path: String) -> Result<XlsxInspection, String>
+
+#[tauri::command]
+async fn convert_xlsx_to_zhihuiji_json(
+    input_path: String,
+    output_path: String,
+) -> Result<ConversionSummary, String>
+```
+
 进度事件：
 
 ```text
@@ -363,6 +392,7 @@ extract:file_progress
 extract:file_warning
 extract:complete
 extract:error
+convert:progress
 ```
 
 Summary 结构：
@@ -477,6 +507,9 @@ struct RunSummary {
 - 应用会将失败图片集中复制到输出包文件夹内的 `_Fail` 文件夹。
 - 应用不会向 C 盘写入临时文件。
 - 应用不要求用户使用命令行。
+- 用户可以在 `XLSX转智绘姬JSON格式` 标签页选择本工具生成的 XLSX，检查记录数量和预览数据，并导出智绘姬可读取的严格 JSON。
+- 转换结果按 XLSX 行顺序生成连续编号，字段映射为 `fixedPrompt`、`fixedPrompt_end` 和 `negativePrompt`，顶层同时包含空的 `images` 对象。
+- 包含十万级记录的 XLSX 转换时，JSON 输出采用逐条写入，不在内存中构建完整 JSON 文档。
 
 ## 14. 已知风险
 
