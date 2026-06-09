@@ -51,7 +51,34 @@ type ConversionSummary = {
   output_path: string;
 };
 
-type ActiveTab = "organizer" | "converter";
+type JsonDedupePreviewItem = {
+  preset_key: string;
+  fixed_prompt: string;
+  negative_prompt: string;
+};
+
+type JsonDedupeInspection = {
+  original_count: number;
+  duplicate_count: number;
+  unique_count: number;
+  preview: JsonDedupePreviewItem[];
+};
+
+type JsonDedupeProgress = {
+  total: number;
+  processed: number;
+  duplicate_count: number;
+  message: string;
+};
+
+type JsonDedupeSummary = {
+  original_count: number;
+  duplicate_count: number;
+  unique_count: number;
+  output_path: string;
+};
+
+type ActiveTab = "organizer" | "converter" | "jsonDedupe";
 
 const organizerState = {
   inputPath: "",
@@ -83,15 +110,28 @@ const converterState = {
   completedOutputPath: ""
 };
 
+const jsonDedupeState = {
+  inputPath: "",
+  outputPath: "",
+  isInspecting: false,
+  isRunning: false,
+  inspection: null as JsonDedupeInspection | null,
+  processed: 0,
+  duplicateCount: 0,
+  status: "请选择智绘姬 JSON 文件。",
+  completedOutputPath: ""
+};
+
 let activeTab: ActiveTab = "organizer";
 let inspectionSequence = 0;
+let jsonDedupeInspectionSequence = 0;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <section class="shell">
     <header class="topbar">
       <div>
         <h1>NovelAI 元数据整理工具</h1>
-        <p>整理 NovelAI 图片元数据，或将已有 XLSX 快速转换为智绘姬 JSON。</p>
+        <p>整理 NovelAI 图片元数据、转换智绘姬 JSON，或清理其中的重复提示词。</p>
       </div>
       <span class="version">v0.1.0</span>
     </header>
@@ -99,6 +139,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
     <nav class="tabs" aria-label="工具页面">
       <button id="organizer-tab" class="tab active" type="button" aria-selected="true">图片整理</button>
       <button id="converter-tab" class="tab" type="button" aria-selected="false">XLSX转智绘姬JSON格式</button>
+      <button id="json-dedupe-tab" class="tab" type="button" aria-selected="false">JSON去重</button>
     </nav>
 
     <div id="organizer-page" class="tab-page">
@@ -231,13 +272,76 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         </div>
       </section>
     </div>
+
+    <div id="json-dedupe-page" class="tab-page" hidden>
+      <section class="panel">
+        <div class="section-title">JSON 输入</div>
+        <div class="converter-row">
+          <button id="choose-json-dedupe-input" type="button">选择 JSON</button>
+          <output id="json-dedupe-input-path" class="path">未选择</output>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">JSON 输出</div>
+        <div class="converter-row">
+          <button id="choose-json-dedupe-output" type="button">选择输出路径</button>
+          <output id="json-dedupe-output-path" class="path">未选择</output>
+        </div>
+      </section>
+
+      <section class="panel mapping-panel">
+        <div class="section-title">去重规则</div>
+        <div class="mapping-grid">
+          <span><strong>比较字段</strong> → fixedPrompt</span>
+          <span><strong>首尾空白</strong> → 忽略</span>
+          <span><strong>空提示词</strong> → 全部保留</span>
+          <span><strong>重复记录</strong> → 保留第一条并连续编号</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="preview-head">
+          <div>
+            <div class="section-title">数据检查与预览</div>
+            <p id="json-dedupe-inspection-status">选择 JSON 后会检查 presets 并预览前 3 条记录。</p>
+          </div>
+          <span class="record-badge">预计保留 <strong id="json-dedupe-unique-badge">0</strong></span>
+        </div>
+        <div id="json-dedupe-preview" class="preview-list">
+          <p class="empty-preview">暂无预览</p>
+        </div>
+      </section>
+
+      <section class="panel status-panel">
+        <div class="status-head">
+          <div>
+            <div class="section-title">去重状态</div>
+            <p id="json-dedupe-status">请选择智绘姬 JSON 文件。</p>
+          </div>
+          <div class="action-row">
+            <button id="open-json-dedupe-output-folder" type="button" disabled>打开所在文件夹</button>
+            <button id="start-json-dedupe" class="primary" type="button" disabled>开始去重</button>
+          </div>
+        </div>
+        <progress id="json-dedupe-progress" max="100" value="0"></progress>
+        <div class="stats">
+          <span>原始记录 <strong id="json-dedupe-total">0</strong></span>
+          <span>已检查 <strong id="json-dedupe-processed">0</strong></span>
+          <span>删除重复 <strong id="json-dedupe-duplicates">0</strong></span>
+          <span>最终保留 <strong id="json-dedupe-unique">0</strong></span>
+        </div>
+      </section>
+    </div>
   </section>
 `;
 
 const organizerTab = document.querySelector<HTMLButtonElement>("#organizer-tab")!;
 const converterTab = document.querySelector<HTMLButtonElement>("#converter-tab")!;
+const jsonDedupeTab = document.querySelector<HTMLButtonElement>("#json-dedupe-tab")!;
 const organizerPage = document.querySelector<HTMLDivElement>("#organizer-page")!;
 const converterPage = document.querySelector<HTMLDivElement>("#converter-page")!;
+const jsonDedupePage = document.querySelector<HTMLDivElement>("#json-dedupe-page")!;
 
 const chooseFolderButton = document.querySelector<HTMLButtonElement>("#choose-folder")!;
 const chooseArchiveButton = document.querySelector<HTMLButtonElement>("#choose-archive")!;
@@ -280,16 +384,49 @@ const conversionProcessed = document.querySelector<HTMLElement>("#conversion-pro
 const startConversionButton = document.querySelector<HTMLButtonElement>("#start-conversion")!;
 const openOutputFolderButton = document.querySelector<HTMLButtonElement>("#open-output-folder")!;
 
+const chooseJsonDedupeInputButton = document.querySelector<HTMLButtonElement>(
+  "#choose-json-dedupe-input"
+)!;
+const chooseJsonDedupeOutputButton = document.querySelector<HTMLButtonElement>(
+  "#choose-json-dedupe-output"
+)!;
+const jsonDedupeInputPath = document.querySelector<HTMLOutputElement>(
+  "#json-dedupe-input-path"
+)!;
+const jsonDedupeOutputPath = document.querySelector<HTMLOutputElement>(
+  "#json-dedupe-output-path"
+)!;
+const jsonDedupeInspectionStatus = document.querySelector<HTMLParagraphElement>(
+  "#json-dedupe-inspection-status"
+)!;
+const jsonDedupeUniqueBadge = document.querySelector<HTMLElement>("#json-dedupe-unique-badge")!;
+const jsonDedupePreview = document.querySelector<HTMLDivElement>("#json-dedupe-preview")!;
+const jsonDedupeStatus = document.querySelector<HTMLParagraphElement>("#json-dedupe-status")!;
+const jsonDedupeProgress = document.querySelector<HTMLProgressElement>("#json-dedupe-progress")!;
+const jsonDedupeTotal = document.querySelector<HTMLElement>("#json-dedupe-total")!;
+const jsonDedupeProcessed = document.querySelector<HTMLElement>("#json-dedupe-processed")!;
+const jsonDedupeDuplicates = document.querySelector<HTMLElement>("#json-dedupe-duplicates")!;
+const jsonDedupeUnique = document.querySelector<HTMLElement>("#json-dedupe-unique")!;
+const startJsonDedupeButton = document.querySelector<HTMLButtonElement>("#start-json-dedupe")!;
+const openJsonDedupeOutputFolderButton = document.querySelector<HTMLButtonElement>(
+  "#open-json-dedupe-output-folder"
+)!;
+
 function render() {
-  const anyRunning = organizerState.isRunning || converterState.isRunning;
+  const anyRunning =
+    organizerState.isRunning || converterState.isRunning || jsonDedupeState.isRunning;
   organizerPage.hidden = activeTab !== "organizer";
   converterPage.hidden = activeTab !== "converter";
+  jsonDedupePage.hidden = activeTab !== "jsonDedupe";
   organizerTab.classList.toggle("active", activeTab === "organizer");
   converterTab.classList.toggle("active", activeTab === "converter");
+  jsonDedupeTab.classList.toggle("active", activeTab === "jsonDedupe");
   organizerTab.setAttribute("aria-selected", String(activeTab === "organizer"));
   converterTab.setAttribute("aria-selected", String(activeTab === "converter"));
+  jsonDedupeTab.setAttribute("aria-selected", String(activeTab === "jsonDedupe"));
   organizerTab.disabled = anyRunning;
   converterTab.disabled = anyRunning;
+  jsonDedupeTab.disabled = anyRunning;
 
   inputPathOutput.textContent = organizerState.inputPath || "未选择";
   outputPathOutput.textContent = organizerState.outputPath || "未选择";
@@ -346,6 +483,38 @@ function render() {
     converterState.completedOutputPath && !converterState.isRunning
   );
   renderPreview();
+
+  jsonDedupeInputPath.textContent = jsonDedupeState.inputPath || "未选择";
+  jsonDedupeOutputPath.textContent = jsonDedupeState.outputPath || "未选择";
+  jsonDedupeStatus.textContent = jsonDedupeState.status;
+  const jsonDedupeOriginalCount = jsonDedupeState.inspection?.original_count ?? 0;
+  const jsonDedupeUniqueCount = jsonDedupeState.inspection?.unique_count ?? 0;
+  jsonDedupeTotal.textContent = String(jsonDedupeOriginalCount);
+  jsonDedupeProcessed.textContent = String(jsonDedupeState.processed);
+  jsonDedupeDuplicates.textContent = String(jsonDedupeState.duplicateCount);
+  jsonDedupeUnique.textContent = String(jsonDedupeUniqueCount);
+  jsonDedupeUniqueBadge.textContent = String(jsonDedupeUniqueCount);
+  jsonDedupeProgress.value = percentage(jsonDedupeState.processed, jsonDedupeOriginalCount);
+  jsonDedupeInspectionStatus.textContent = jsonDedupeState.isInspecting
+    ? "正在检查 JSON..."
+    : jsonDedupeState.inspection
+      ? `检查完成：共 ${jsonDedupeOriginalCount} 条，发现 ${jsonDedupeState.inspection.duplicate_count} 条重复。`
+      : "选择 JSON 后会检查 presets 并预览前 3 条记录。";
+  chooseJsonDedupeInputButton.disabled =
+    jsonDedupeState.isInspecting || jsonDedupeState.isRunning;
+  chooseJsonDedupeOutputButton.disabled =
+    jsonDedupeState.isInspecting || jsonDedupeState.isRunning;
+  startJsonDedupeButton.disabled = !Boolean(
+    jsonDedupeState.inspection &&
+      jsonDedupeState.inputPath &&
+      jsonDedupeState.outputPath &&
+      !jsonDedupeState.isInspecting &&
+      !jsonDedupeState.isRunning
+  );
+  openJsonDedupeOutputFolderButton.disabled = !Boolean(
+    jsonDedupeState.completedOutputPath && !jsonDedupeState.isRunning
+  );
+  renderJsonDedupePreview();
 }
 
 function renderWarnings() {
@@ -394,6 +563,33 @@ function renderPreview() {
   });
 }
 
+function renderJsonDedupePreview() {
+  jsonDedupePreview.innerHTML = "";
+  const preview = jsonDedupeState.inspection?.preview ?? [];
+  if (preview.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "empty-preview";
+    empty.textContent = jsonDedupeState.inspection ? "presets 中没有记录" : "暂无预览";
+    jsonDedupePreview.append(empty);
+    return;
+  }
+
+  preview.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "preview-card";
+    card.innerHTML = `
+      <div class="preview-index"></div>
+      <div class="preview-field"><strong>fixedPrompt</strong><pre></pre></div>
+      <div class="preview-field"><strong>negativePrompt</strong><pre></pre></div>
+    `;
+    card.querySelector(".preview-index")!.textContent = `原始键 ${item.preset_key}`;
+    const values = card.querySelectorAll("pre");
+    values[0].textContent = item.fixed_prompt || "（空）";
+    values[1].textContent = item.negative_prompt || "（空）";
+    jsonDedupePreview.append(card);
+  });
+}
+
 function percentage(processedCount: number, totalCount: number): number {
   return totalCount === 0 ? 0 : Math.round((processedCount / totalCount) * 100);
 }
@@ -409,8 +605,14 @@ function suggestedJsonPath(xlsxPath: string): string {
   return /\.xlsx$/i.test(xlsxPath) ? xlsxPath.replace(/\.xlsx$/i, ".json") : `${xlsxPath}.json`;
 }
 
+function suggestedDedupedJsonPath(jsonPath: string): string {
+  return /\.json$/i.test(jsonPath)
+    ? jsonPath.replace(/\.json$/i, "_deduped.json")
+    : `${jsonPath}_deduped.json`;
+}
+
 function selectTab(tab: ActiveTab) {
-  if (organizerState.isRunning || converterState.isRunning) {
+  if (organizerState.isRunning || converterState.isRunning || jsonDedupeState.isRunning) {
     return;
   }
   activeTab = tab;
@@ -419,6 +621,7 @@ function selectTab(tab: ActiveTab) {
 
 organizerTab.addEventListener("click", () => selectTab("organizer"));
 converterTab.addEventListener("click", () => selectTab("converter"));
+jsonDedupeTab.addEventListener("click", () => selectTab("jsonDedupe"));
 
 chooseFolderButton.addEventListener("click", async () => {
   const selected = await open({ directory: true, multiple: false });
@@ -614,6 +817,121 @@ openOutputFolderButton.addEventListener("click", async () => {
   }
 });
 
+chooseJsonDedupeInputButton.addEventListener("click", async () => {
+  const selected = normalizeSelectedPath(
+    await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "JSON 文件", extensions: ["json"] }]
+    })
+  );
+  if (!selected) {
+    return;
+  }
+
+  const currentSequence = ++jsonDedupeInspectionSequence;
+  jsonDedupeState.inputPath = selected;
+  jsonDedupeState.outputPath = suggestedDedupedJsonPath(selected);
+  jsonDedupeState.inspection = null;
+  jsonDedupeState.completedOutputPath = "";
+  jsonDedupeState.processed = 0;
+  jsonDedupeState.duplicateCount = 0;
+  jsonDedupeState.isInspecting = true;
+  jsonDedupeState.status = "正在检查 JSON...";
+  render();
+
+  try {
+    const inspection = await invoke<JsonDedupeInspection>("inspect_zhihuiji_json", {
+      inputPath: selected
+    });
+    if (currentSequence !== jsonDedupeInspectionSequence) {
+      return;
+    }
+    jsonDedupeState.inspection = inspection;
+    jsonDedupeState.duplicateCount = inspection.duplicate_count;
+    jsonDedupeState.status = `检查完成：${inspection.original_count} 条记录中有 ${inspection.duplicate_count} 条重复，预计保留 ${inspection.unique_count} 条。`;
+  } catch (error) {
+    if (currentSequence !== jsonDedupeInspectionSequence) {
+      return;
+    }
+    jsonDedupeState.status = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (currentSequence === jsonDedupeInspectionSequence) {
+      jsonDedupeState.isInspecting = false;
+      render();
+    }
+  }
+});
+
+chooseJsonDedupeOutputButton.addEventListener("click", async () => {
+  const selected = await save({
+    defaultPath: jsonDedupeState.outputPath || "zhihuiji_presets_deduped.json",
+    filters: [{ name: "JSON 文件", extensions: ["json"] }]
+  });
+  const outputPath = normalizeSelectedPath(selected);
+  if (!outputPath) {
+    return;
+  }
+  jsonDedupeState.outputPath = outputPath;
+  jsonDedupeState.completedOutputPath = "";
+  jsonDedupeState.status = jsonDedupeState.inspection
+    ? `已选择输出路径，将保留 ${jsonDedupeState.inspection.unique_count} 条记录。`
+    : jsonDedupeState.status;
+  render();
+});
+
+startJsonDedupeButton.addEventListener("click", async () => {
+  if (
+    !jsonDedupeState.inspection ||
+    !jsonDedupeState.inputPath ||
+    !jsonDedupeState.outputPath ||
+    jsonDedupeState.isRunning
+  ) {
+    return;
+  }
+
+  jsonDedupeState.isRunning = true;
+  jsonDedupeState.processed = 0;
+  jsonDedupeState.duplicateCount = 0;
+  jsonDedupeState.completedOutputPath = "";
+  jsonDedupeState.status = "正在去重...";
+  render();
+
+  try {
+    const summary = await invoke<JsonDedupeSummary>("dedupe_zhihuiji_json", {
+      inputPath: jsonDedupeState.inputPath,
+      outputPath: jsonDedupeState.outputPath
+    });
+    jsonDedupeState.processed = summary.original_count;
+    jsonDedupeState.duplicateCount = summary.duplicate_count;
+    jsonDedupeState.inspection = {
+      ...jsonDedupeState.inspection,
+      original_count: summary.original_count,
+      duplicate_count: summary.duplicate_count,
+      unique_count: summary.unique_count
+    };
+    jsonDedupeState.completedOutputPath = summary.output_path;
+    jsonDedupeState.status = `去重完成：删除 ${summary.duplicate_count} 条，保留 ${summary.unique_count} 条，已保存到 ${summary.output_path}`;
+  } catch (error) {
+    jsonDedupeState.status = error instanceof Error ? error.message : String(error);
+  } finally {
+    jsonDedupeState.isRunning = false;
+    render();
+  }
+});
+
+openJsonDedupeOutputFolderButton.addEventListener("click", async () => {
+  if (!jsonDedupeState.completedOutputPath) {
+    return;
+  }
+  try {
+    await invoke("open_output_folder", { path: jsonDedupeState.completedOutputPath });
+  } catch (error) {
+    jsonDedupeState.status = error instanceof Error ? error.message : String(error);
+    render();
+  }
+});
+
 await listen<ProgressPayload>("extract:start", (event) => {
   organizerState.total = event.payload.total_png ?? 0;
   organizerState.processed = 0;
@@ -658,6 +976,16 @@ await listen<ConversionProgress>("convert:progress", (event) => {
   }
   converterState.processed = event.payload.processed;
   converterState.status = event.payload.message;
+  render();
+});
+
+await listen<JsonDedupeProgress>("json-dedupe:progress", (event) => {
+  if (!jsonDedupeState.isRunning) {
+    return;
+  }
+  jsonDedupeState.processed = event.payload.processed;
+  jsonDedupeState.duplicateCount = event.payload.duplicate_count;
+  jsonDedupeState.status = event.payload.message;
   render();
 });
 

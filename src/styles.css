@@ -56,7 +56,7 @@ button:disabled {
   border-radius: 8px;
   display: grid;
   gap: 4px;
-  grid-template-columns: minmax(150px, 0.7fr) minmax(260px, 1.3fr);
+  grid-template-columns: minmax(150px, 0.8fr) minmax(260px, 1.4fr) minmax(150px, 0.8fr);
   padding: 4px;
 }
 
