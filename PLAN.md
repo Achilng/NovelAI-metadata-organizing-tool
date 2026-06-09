@@ -340,7 +340,7 @@ artist:sune (mugendai)
 
 ## 10.3 XLSX 转智绘姬 JSON
 
-- 主界面使用两个顶部标签页：`图片整理` 和 `XLSX转智绘姬JSON格式`，两个页面的路径、状态和结果互不影响。
+- 主界面使用三个顶部标签页：`图片整理`、`XLSX转智绘姬JSON格式` 和 `JSON去重`，三个页面的路径、状态和结果互不影响。
 - 转换页只读取 XLSX 中已经保留的记录，不重新扫描原始 PNG，也不恢复去重时被跳过的数据。
 - 选择 XLSX 后自动检查“正向提示词”和“负向提示词”表头，统计有效记录并预览前 3 条。
 - JSON 输出路径默认使用 XLSX 同目录和同文件名，并把扩展名改为 `.json`；用户可以另选路径。
@@ -353,6 +353,16 @@ artist:sune (mugendai)
 - JSON 使用 UTF-8 和严格 JSON 语法，提示词中的换行、引号、反斜杠和 Unicode 字符由 JSON 序列化器转义。
 - 转换过程逐条写入同目录临时文件，成功后再替换目标文件，避免失败时留下不完整 JSON。
 - 转换期间显示已处理数量和进度，并锁定标签页和路径选择；完成后可以打开输出文件所在目录。
+
+## 10.4 智绘姬 JSON 去重
+
+- `JSON去重` 页面直接读取智绘姬 JSON，不经过 XLSX，也不修改输入文件。
+- 选择 JSON 后检查顶层对象和 `presets` 对象，统计原始记录、重复记录和预计保留记录，并预览前 3 条。
+- 使用裁剪首尾空白后的完整 `fixedPrompt` 作为去重 key，比较区分大小写；空白、缺失或非字符串的 `fixedPrompt` 不参与去重。
+- 按输入 JSON 中 `presets` 的对象顺序处理，重复时保留首次出现的完整记录，随后使用 `1`、`2` 等连续字符串键重新编号。
+- 每条保留记录的全部字段、顶层 `images` 和其他顶层字段均保留；输出为格式化的严格 UTF-8 JSON，不保证沿用原始缩进。
+- 默认输出路径在输入文件名后增加 `_deduped`；输入和输出路径不能相同。
+- 输出使用同目录临时文件写入并在成功后替换目标，处理期间显示检查数量和重复数量，完成后可以打开输出文件所在目录。
 
 ## 11. 后端命令设计
 
@@ -381,6 +391,17 @@ async fn convert_xlsx_to_zhihuiji_json(
     input_path: String,
     output_path: String,
 ) -> Result<ConversionSummary, String>
+
+#[tauri::command]
+async fn inspect_zhihuiji_json(
+    input_path: String,
+) -> Result<JsonDedupeInspection, String>
+
+#[tauri::command]
+async fn dedupe_zhihuiji_json(
+    input_path: String,
+    output_path: String,
+) -> Result<JsonDedupeSummary, String>
 ```
 
 进度事件：
@@ -393,6 +414,7 @@ extract:file_warning
 extract:complete
 extract:error
 convert:progress
+json-dedupe:progress
 ```
 
 Summary 结构：
@@ -510,6 +532,8 @@ struct RunSummary {
 - 用户可以在 `XLSX转智绘姬JSON格式` 标签页选择本工具生成的 XLSX，检查记录数量和预览数据，并导出智绘姬可读取的严格 JSON。
 - 转换结果按 XLSX 行顺序生成连续编号，字段映射为 `fixedPrompt`、`fixedPrompt_end` 和 `negativePrompt`，顶层同时包含空的 `images` 对象。
 - 包含十万级记录的 XLSX 转换时，JSON 输出采用逐条写入，不在内存中构建完整 JSON 文档。
+- 用户可以在 `JSON去重` 标签页选择智绘姬 JSON，查看重复统计和预览，并将按 `fixedPrompt` 去重后的结果导出到新文件。
+- JSON 去重会保留第一条重复记录的全部字段、所有空提示词记录及其他顶层数据，并将 `presets` 重新连续编号。
 
 ## 14. 已知风险
 
