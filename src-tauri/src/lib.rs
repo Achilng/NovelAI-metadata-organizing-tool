@@ -4,9 +4,10 @@ use tauri::{AppHandle, Emitter};
 mod extractor;
 
 use extractor::{
-    convert_xlsx_file, inspect_xlsx_file, run_extraction_with_options, ConversionProgress,
-    ConversionSummary, ExtractionOptions, FileWarning, ProgressPayload, ProgressSink, RunSummary,
-    XlsxInspection,
+    convert_xlsx_file, dedupe_zhihuiji_json_file, inspect_xlsx_file, inspect_zhihuiji_json_file,
+    run_extraction_with_options, ConversionProgress, ConversionSummary, ExtractionOptions,
+    FileWarning, JsonDedupeInspection, JsonDedupeProgress, JsonDedupeSummary, ProgressPayload,
+    ProgressSink, RunSummary, XlsxInspection,
 };
 
 struct TauriProgressSink {
@@ -85,6 +86,35 @@ async fn convert_xlsx_to_zhihuiji_json(
 }
 
 #[tauri::command]
+async fn inspect_zhihuiji_json(input_path: String) -> Result<JsonDedupeInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_zhihuiji_json_file(Path::new(&input_path)))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn dedupe_zhihuiji_json(
+    app: AppHandle,
+    input_path: String,
+    output_path: String,
+) -> Result<JsonDedupeSummary, String> {
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        dedupe_zhihuiji_json_file(
+            Path::new(&input_path),
+            Path::new(&output_path),
+            |payload: JsonDedupeProgress| {
+                let _ = app_for_task.emit("json-dedupe:progress", payload);
+            },
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn open_output_folder(path: String) -> Result<(), String> {
     let path = PathBuf::from(path);
     let folder = if path.is_dir() {
@@ -113,6 +143,8 @@ pub fn run() {
             extract_to_xlsx,
             inspect_xlsx,
             convert_xlsx_to_zhihuiji_json,
+            inspect_zhihuiji_json,
+            dedupe_zhihuiji_json,
             open_output_folder
         ])
         .run(tauri::generate_context!())
