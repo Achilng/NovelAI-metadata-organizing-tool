@@ -9,6 +9,7 @@
 - 新增 3 个后端测试，覆盖顺序、首尾空白、大小写、空/缺失提示词、额外字段、错误结构、同路径和 1000 条批量记录。
 - 后端去重能力提交：`6b4c630`；前端去重页面提交：`8849935`，均已推送到 GitHub。
 - 验证 Rust 37 个测试全部通过，`npm.cmd run build` 通过。
+- 完成 `v10` Windows release 构建并准备发布，独立 EXE 为 `src-tauri\target\release\novelai-metadata-organizing-tool.exe`（12,658,688 字节），同时生成 MSI 和 NSIS 安装包。
 
 ## 2026-06-07 XLSX 转智绘姬 JSON
 - 新增顶部双标签页：`图片整理` 与 `XLSX转智绘姬JSON格式`，两个页面状态独立保存。
@@ -115,6 +116,7 @@
 - 视需要补充取消按钮、拖放输入和缓存清理入口等增强功能。
 
 ## 记录
+- 2026-06-09：完成 `v10` Windows release 构建，验证 Tauri release、MSI 和 NSIS 打包全部通过。
 - 2026-06-09：完成智绘姬 JSON 检查、按正面提示词去重和第三个功能页；验证 Rust 37 个测试及前端生产构建通过。
 - 2026-06-07：完成 XLSX 转智绘姬 JSON 后端、双标签页转换界面和 Windows release 打包；验证 Rust 34 个测试、前端生产构建及 MSI/NSIS 打包全部通过。
 - 2026-05-23：创建 `PROGRESS.md`。
