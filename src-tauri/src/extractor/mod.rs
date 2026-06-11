@@ -14,7 +14,8 @@ pub use json_dedupe::{
     dedupe_zhihuiji_json_file, inspect_zhihuiji_json_file, JsonDedupeInspection,
     JsonDedupeProgress, JsonDedupeSummary,
 };
+pub use cache::CacheClearSummary;
 pub use service::{
-    run_extraction_with_options, ExtractionOptions, FileWarning, ProgressPayload, ProgressSink,
-    RunSummary,
+    clear_metadata_cache_for_output, run_extraction_with_options, ExtractionOptions, FileWarning,
+    ImageOutputMode, ProgressPayload, ProgressSink, RunSummary,
 };

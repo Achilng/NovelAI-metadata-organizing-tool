@@ -4,10 +4,11 @@ use tauri::{AppHandle, Emitter};
 mod extractor;
 
 use extractor::{
-    convert_xlsx_file, dedupe_zhihuiji_json_file, inspect_xlsx_file, inspect_zhihuiji_json_file,
-    run_extraction_with_options, ConversionProgress, ConversionSummary, ExtractionOptions,
-    FileWarning, JsonDedupeInspection, JsonDedupeProgress, JsonDedupeSummary, ProgressPayload,
-    ProgressSink, RunSummary, XlsxInspection,
+    clear_metadata_cache_for_output, convert_xlsx_file, dedupe_zhihuiji_json_file,
+    inspect_xlsx_file, inspect_zhihuiji_json_file, run_extraction_with_options, CacheClearSummary,
+    ConversionProgress, ConversionSummary, ExtractionOptions, FileWarning, ImageOutputMode,
+    JsonDedupeInspection, JsonDedupeProgress, JsonDedupeSummary, ProgressPayload, ProgressSink,
+    RunSummary, XlsxInspection,
 };
 
 struct TauriProgressSink {
@@ -33,8 +34,11 @@ async fn extract_to_xlsx(
     dedupe_artist_tags: bool,
     sort_by_time: bool,
     incremental: bool,
+    image_output_mode: String,
 ) -> Result<RunSummary, String> {
     let app_for_task = app.clone();
+    let image_output_mode = ImageOutputMode::parse(&image_output_mode)
+        .ok_or_else(|| format!("未知的图片输出方式：{image_output_mode}"))?;
 
     tauri::async_runtime::spawn_blocking(move || {
         let sink = TauriProgressSink { app: app_for_task };
@@ -43,6 +47,7 @@ async fn extract_to_xlsx(
             dedupe_artist_tags,
             sort_by_time,
             incremental,
+            image_output_mode,
         };
         run_extraction_with_options(
             Path::new(&input_path),
@@ -54,6 +59,16 @@ async fn extract_to_xlsx(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn clear_metadata_cache(output_path: String) -> Result<CacheClearSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_metadata_cache_for_output(Path::new(&output_path))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -141,6 +156,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             extract_to_xlsx,
+            clear_metadata_cache,
             inspect_xlsx,
             convert_xlsx_to_zhihuiji_json,
             inspect_zhihuiji_json,

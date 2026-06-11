@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,6 +135,110 @@ impl CacheStore {
         self.records_dir
             .join(format!("{}.json", stable_hash_hex(display_path)))
     }
+
+    /// 删除当前扫描中已不存在的图片对应的缓存记录和缩略图，返回删除的文件数量。
+    ///
+    /// 以磁盘内容为准（而不是内存中的记录表），这样并行写入的新记录不会被误删，
+    /// 中断运行残留的孤儿缩略图也能一并清掉。
+    pub fn prune_missing(&mut self, current_display_paths: &HashSet<String>) -> Result<usize> {
+        let expected_stems: HashSet<String> = current_display_paths
+            .iter()
+            .map(|display_path| stable_hash_hex(display_path))
+            .collect();
+
+        let mut removed = 0_usize;
+        removed += remove_unexpected_files(&self.records_dir, "json", &expected_stems)?;
+        removed += remove_unexpected_files(&self.thumbnails_dir, "png", &expected_stems)?;
+
+        self.records
+            .retain(|display_path, _| current_display_paths.contains(display_path));
+
+        Ok(removed)
+    }
+}
+
+fn remove_unexpected_files(
+    dir: &Path,
+    extension: &str,
+    expected_stems: &HashSet<String>,
+) -> Result<usize> {
+    let mut removed = 0_usize;
+
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("无法读取缓存目录：{}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("无法读取缓存目录条目：{}", dir.display()))?;
+        if !entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+        {
+            continue;
+        }
+
+        let stem_matches = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|stem| expected_stems.contains(stem));
+        if stem_matches {
+            continue;
+        }
+
+        fs::remove_file(&path)
+            .with_context(|| format!("无法删除失效缓存文件：{}", path.display()))?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheClearSummary {
+    pub existed: bool,
+    pub removed_files: usize,
+    pub freed_bytes: u64,
+}
+
+/// 删除输出路径同级的整个 `.novelai_metadata_cache` 目录。
+pub fn clear_cache_root(output_parent: &Path) -> Result<CacheClearSummary> {
+    let cache_root = output_parent.join(CACHE_DIR_NAME);
+    if !cache_root.is_dir() {
+        return Ok(CacheClearSummary {
+            existed: false,
+            removed_files: 0,
+            freed_bytes: 0,
+        });
+    }
+
+    let mut removed_files = 0_usize;
+    let mut freed_bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(&cache_root) {
+        let entry =
+            entry.with_context(|| format!("无法统计缓存目录：{}", cache_root.display()))?;
+        if entry.file_type().is_file() {
+            removed_files += 1;
+            freed_bytes += entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        }
+    }
+
+    fs::remove_dir_all(&cache_root)
+        .with_context(|| format!("无法删除缓存目录：{}", cache_root.display()))?;
+
+    Ok(CacheClearSummary {
+        existed: true,
+        removed_files,
+        freed_bytes,
+    })
 }
 
 pub fn system_time_to_nanos(time: SystemTime) -> Option<u128> {

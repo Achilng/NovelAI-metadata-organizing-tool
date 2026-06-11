@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { ask, open, save } from "@tauri-apps/plugin-dialog";
 import "./styles.css";
 
 type RunSummary = {
@@ -17,6 +17,14 @@ type RunSummary = {
 type FileWarning = {
   path: string;
   message: string;
+};
+
+type ImageOutputMode = "copy" | "hardlink" | "none";
+
+type CacheClearSummary = {
+  existed: boolean;
+  removed_files: number;
+  freed_bytes: number;
 };
 
 type ProgressPayload = {
@@ -88,6 +96,8 @@ const organizerState = {
   dedupeArtistTags: false,
   sortByTime: false,
   incremental: true,
+  imageOutputMode: "copy" as ImageOutputMode,
+  isClearingCache: false,
   processed: 0,
   failed: 0,
   skippedDuplicates: 0,
@@ -156,6 +166,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <div class="section-title">输出</div>
         <div class="row">
           <button id="choose-output" type="button">选择输出路径</button>
+          <button id="clear-cache" type="button" disabled>清理缓存</button>
           <output id="output-path" class="path">未选择</output>
         </div>
       </section>
@@ -178,6 +189,14 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <label class="toggle-option">
             <input id="incremental" type="checkbox" />
             <span>增量整理</span>
+          </label>
+          <label class="toggle-option select-option">
+            <span>图片输出</span>
+            <select id="image-output-mode">
+              <option value="copy">复制原图</option>
+              <option value="hardlink">硬链接（同分区不占空间）</option>
+              <option value="none">不输出图片文件夹</option>
+            </select>
           </label>
         </div>
       </section>
@@ -346,6 +365,8 @@ const jsonDedupePage = document.querySelector<HTMLDivElement>("#json-dedupe-page
 const chooseFolderButton = document.querySelector<HTMLButtonElement>("#choose-folder")!;
 const chooseArchiveButton = document.querySelector<HTMLButtonElement>("#choose-archive")!;
 const chooseOutputButton = document.querySelector<HTMLButtonElement>("#choose-output")!;
+const clearCacheButton = document.querySelector<HTMLButtonElement>("#clear-cache")!;
+const imageOutputModeSelect = document.querySelector<HTMLSelectElement>("#image-output-mode")!;
 const startButton = document.querySelector<HTMLButtonElement>("#start")!;
 const dedupePositivePromptCheckbox = document.querySelector<HTMLInputElement>(
   "#dedupe-positive-prompt"
@@ -441,12 +462,19 @@ function render() {
   progress.value = percentage(organizerState.processed, organizerState.total);
 
   const canStart = Boolean(
-    organizerState.inputPath && organizerState.outputPath && !organizerState.isRunning
+    organizerState.inputPath &&
+      organizerState.outputPath &&
+      !organizerState.isRunning &&
+      !organizerState.isClearingCache
   );
   startButton.disabled = !canStart;
   chooseFolderButton.disabled = organizerState.isRunning;
   chooseArchiveButton.disabled = organizerState.isRunning;
   chooseOutputButton.disabled = organizerState.isRunning;
+  clearCacheButton.disabled =
+    organizerState.isRunning || organizerState.isClearingCache || !organizerState.outputPath;
+  imageOutputModeSelect.value = organizerState.imageOutputMode;
+  imageOutputModeSelect.disabled = organizerState.isRunning;
   dedupePositivePromptCheckbox.checked = organizerState.dedupePositivePrompt;
   dedupePositivePromptCheckbox.disabled = organizerState.isRunning;
   dedupeArtistTagsCheckbox.checked = organizerState.dedupeArtistTags;
@@ -594,6 +622,19 @@ function percentage(processedCount: number, totalCount: number): number {
   return totalCount === 0 ? 0 : Math.round((processedCount / totalCount) * 100);
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+}
+
 function normalizeSelectedPath(value: string | string[] | null): string {
   if (Array.isArray(value)) {
     return value[0] ?? "";
@@ -671,6 +712,43 @@ incrementalCheckbox.addEventListener("change", () => {
   render();
 });
 
+imageOutputModeSelect.addEventListener("change", () => {
+  organizerState.imageOutputMode = imageOutputModeSelect.value as ImageOutputMode;
+  render();
+});
+
+clearCacheButton.addEventListener("click", async () => {
+  if (!organizerState.outputPath || organizerState.isRunning || organizerState.isClearingCache) {
+    return;
+  }
+
+  const confirmed = await ask(
+    "将删除输出路径同级的 .novelai_metadata_cache 缓存目录，下次整理需要重新解析全部图片。确定清理吗？",
+    { title: "清理缓存", kind: "warning" }
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  organizerState.isClearingCache = true;
+  organizerState.status = "正在清理缓存...";
+  render();
+
+  try {
+    const summary = await invoke<CacheClearSummary>("clear_metadata_cache", {
+      outputPath: organizerState.outputPath
+    });
+    organizerState.status = summary.existed
+      ? `缓存清理完成：删除 ${summary.removed_files} 个文件，释放 ${formatBytes(summary.freed_bytes)}。`
+      : "未找到缓存目录，无需清理。";
+  } catch (error) {
+    organizerState.status = error instanceof Error ? error.message : String(error);
+  } finally {
+    organizerState.isClearingCache = false;
+    render();
+  }
+});
+
 startButton.addEventListener("click", async () => {
   if (!organizerState.inputPath || !organizerState.outputPath || organizerState.isRunning) {
     return;
@@ -695,7 +773,8 @@ startButton.addEventListener("click", async () => {
       dedupePositivePrompt: organizerState.dedupePositivePrompt,
       dedupeArtistTags: organizerState.dedupeArtistTags,
       sortByTime: organizerState.sortByTime,
-      incremental: organizerState.incremental
+      incremental: organizerState.incremental,
+      imageOutputMode: organizerState.imageOutputMode
     });
     organizerState.total = summary.total_png;
     organizerState.processed = summary.processed;

@@ -179,6 +179,20 @@ p {
   opacity: 0.72;
 }
 
+.select-option select {
+  background: #fff;
+  border: 1px solid #d9dee7;
+  border-radius: 4px;
+  color: #273344;
+  font: inherit;
+  padding: 4px 6px;
+}
+
+.select-option:has(select:disabled) {
+  color: #8b96a6;
+  opacity: 0.72;
+}
+
 .status-panel {
   display: grid;
   gap: 14px;

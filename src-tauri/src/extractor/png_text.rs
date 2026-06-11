@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use flate2::read::ZlibDecoder;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
@@ -14,7 +14,9 @@ pub fn read_png_text_chunks(path: impl AsRef<Path>) -> Result<BTreeMap<String, S
     read_png_text_chunks_from_reader(file)
 }
 
-pub fn read_png_text_chunks_from_reader(mut reader: impl Read) -> Result<BTreeMap<String, String>> {
+pub fn read_png_text_chunks_from_reader(
+    mut reader: impl Read + Seek,
+) -> Result<BTreeMap<String, String>> {
     let mut signature = [0_u8; 8];
     reader
         .read_exact(&mut signature)
@@ -25,32 +27,39 @@ pub fn read_png_text_chunks_from_reader(mut reader: impl Read) -> Result<BTreeMa
 
     let mut chunks = BTreeMap::new();
     loop {
-        let mut length_bytes = [0_u8; 4];
-        match reader.read_exact(&mut length_bytes) {
+        let mut header = [0_u8; 8];
+        match reader.read_exact(&mut header) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(error).context("无法读取 PNG chunk 长度"),
+            Err(error) => return Err(error).context("无法读取 PNG chunk 头"),
         }
 
-        let length = u32::from_be_bytes(length_bytes);
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let chunk_type = [header[4], header[5], header[6], header[7]];
+
+        let is_text_chunk = matches!(&chunk_type, b"tEXt" | b"zTXt" | b"iTXt");
+        if !is_text_chunk {
+            if &chunk_type == b"IEND" {
+                break;
+            }
+            // 像素数据等无关 chunk 直接跳过（数据 + 4 字节 CRC），避免整文件读取。
+            reader
+                .seek(SeekFrom::Current(i64::from(length) + 4))
+                .context("无法跳过 PNG chunk 数据")?;
+            continue;
+        }
+
         if length > MAX_TEXT_CHUNK_BYTES {
             bail!("PNG 文本 chunk 过大");
         }
-
-        let mut chunk_type = [0_u8; 4];
-        reader
-            .read_exact(&mut chunk_type)
-            .context("无法读取 PNG chunk 类型")?;
 
         let mut data = vec![0_u8; length as usize];
         reader
             .read_exact(&mut data)
             .context("无法读取 PNG chunk 数据")?;
-
-        let mut crc = [0_u8; 4];
         reader
-            .read_exact(&mut crc)
-            .context("无法读取 PNG chunk CRC")?;
+            .seek(SeekFrom::Current(4))
+            .context("无法跳过 PNG chunk CRC")?;
 
         match &chunk_type {
             b"tEXt" => {
@@ -68,8 +77,7 @@ pub fn read_png_text_chunks_from_reader(mut reader: impl Read) -> Result<BTreeMa
                     chunks.entry(keyword).or_insert(text);
                 }
             }
-            b"IEND" => break,
-            _ => {}
+            _ => unreachable!("non-text chunks are skipped above"),
         }
     }
 
@@ -153,13 +161,13 @@ mod tests {
     use super::read_png_text_chunks_from_reader;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     #[test]
     fn reads_text_chunks() {
         let png = png_with_chunks(vec![chunk(b"tEXt", b"Description\0artist:test")]);
 
-        let chunks = read_png_text_chunks_from_reader(&png[..]).unwrap();
+        let chunks = read_png_text_chunks_from_reader(Cursor::new(png)).unwrap();
 
         assert_eq!(chunks.get("Description"), Some(&"artist:test".to_string()));
     }
@@ -172,7 +180,7 @@ mod tests {
         data.extend(compressed);
         let png = png_with_chunks(vec![chunk(b"zTXt", &data)]);
 
-        let chunks = read_png_text_chunks_from_reader(&png[..]).unwrap();
+        let chunks = read_png_text_chunks_from_reader(Cursor::new(png)).unwrap();
 
         assert_eq!(
             chunks.get("Comment"),
@@ -190,9 +198,25 @@ mod tests {
         data.extend("中文提示词".as_bytes());
         let png = png_with_chunks(vec![chunk(b"iTXt", &data)]);
 
-        let chunks = read_png_text_chunks_from_reader(&png[..]).unwrap();
+        let chunks = read_png_text_chunks_from_reader(Cursor::new(png)).unwrap();
 
         assert_eq!(chunks.get("Comment"), Some(&"中文提示词".to_string()));
+    }
+
+    #[test]
+    fn skips_large_non_text_chunks_and_reads_following_text() {
+        let big_idat = vec![0_u8; 128 * 1024 * 1024];
+        let png = png_with_chunks(vec![
+            chunk(b"IDAT", &big_idat),
+            chunk(b"tEXt", b"Description\0artist:after-idat"),
+        ]);
+
+        let chunks = read_png_text_chunks_from_reader(Cursor::new(png)).unwrap();
+
+        assert_eq!(
+            chunks.get("Description"),
+            Some(&"artist:after-idat".to_string())
+        );
     }
 
     fn png_with_chunks(chunks: Vec<Vec<u8>>) -> Vec<u8> {
